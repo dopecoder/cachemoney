@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Pre-push gate: keep main green. Install with `make hooks`.
+set -euo pipefail
+
+echo "[pre-push] go vet ./..."
+go vet ./...
+
+echo "[pre-push] go test -race ./..."
+go test -race ./...
+
+echo "[pre-push] ok"

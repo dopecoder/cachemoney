@@ -1,0 +1,57 @@
+---
+# golangci-lint v2 configuration for cachemoney.
+# Enforced in CI (.github/workflows/ci.yml). Run locally with `make lint`.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # Curated set (not enable-all) so toolchain upgrades stay predictable.
+  default: none
+  enable:
+    - bodyclose # HTTP/response bodies are closed
+    - errcheck # unchecked errors
+    - gocritic # opinionated diagnostics
+    - gosec # security issues
+    - govet # go vet
+    - ineffassign # ineffectual assignments
+    - misspell # common misspellings
+    - nakedret # no naked returns in long funcs
+    - revive # golint successor
+    - staticcheck # staticcheck/simple/stylecheck suite
+    - unconvert # redundant conversions
+    - unparam # unused function params
+    - unused # unused code
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+    gosec:
+      excludes:
+        - G404 # math/rand ok for non-crypto jitter/bench
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: error-strings
+        - name: context-as-argument
+        - name: indent-error-flow
+  exclusions:
+    rules:
+      # Tests may be looser on security and param usage.
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+
+formatters:
+  enable:
+    - gofumpt # stricter gofmt
+    - goimports # import grouping + local prefix
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/dopecoder/cachemoney

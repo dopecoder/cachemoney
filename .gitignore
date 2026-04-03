@@ -1,0 +1,26 @@
+# --- Local Pi runtime state ---
+.atl/
+.pi/
+
+# --- Build output ---
+/bin/
+/dist/
+/cachemoney
+/cachemoney.exe
+
+# --- Test & coverage artifacts ---
+*.out
+*.test
+coverage.txt
+coverage.html
+profile.cov
+
+# --- Go workspace / vendor (not used yet) ---
+go.work
+go.work.sum
+
+# --- Editor / OS noise ---
+.idea/
+.vscode/
+*.swp
+.DS_Store

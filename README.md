@@ -47,12 +47,25 @@ make run      # build and run
 ```text
 cmd/cachemoney/      # binary entrypoint
 internal/store/      # in-memory KV store (Get/Set/Del/TTL)  ← M0 core
+docs/architecture/   # ARCHITECTURE.md + decision records (ADRs)
 .github/workflows/   # CI (vet, race tests, coverage, lint)
 scripts/git-hooks/   # optional pre-push gate (make hooks)
 ```
 
 Packages live under `internal/` until their API stabilizes; mature libraries
 get promoted to standalone repositories (the "extract as you go" model).
+
+## Architecture
+
+The design — the engine/protocol spine, why Go (and what it costs vs pogocache),
+sharding, eviction, and the M0–M4 roadmap — lives in
+[`docs/architecture/ARCHITECTURE.md`](./docs/architecture/ARCHITECTURE.md). Every
+consequential decision and its trade-offs are recorded as
+[ADRs](./docs/architecture/decisions/).
+
+New to the concepts (Robin Hood hashing, sharding, HashDoS, Go GC, eviction,
+RESP, Raft, …)? [`docs/knowledge.md`](./docs/knowledge.md) is a from-scratch
+reference explaining every piece and its trade-offs.
 
 ## Development
 

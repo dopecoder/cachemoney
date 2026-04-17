@@ -30,7 +30,10 @@ func fnv64(s string) uint64 {
 //   - DIB monotonicity: an entry sits at most one slot deeper than its immediate
 //     predecessor;
 //   - the number of occupied slots equals t.count;
-//   - the load factor stays at or below ~0.75 (count <= growAt).
+//   - the load factor stays at or below ~0.75 (count <= growAt);
+//   - no tombstones / no holes: every occupied entry is reachable from its home by a
+//     contiguous probe walk on which the Robin Hood early-exit never trips (the
+//     post-delete contract that backward-shift must preserve — increment 3).
 //
 // It is reused by later increments (delete/shrink + property suite).
 func checkInvariants[K comparable, V any](t *testing.T, tbl *table[K, V]) {
@@ -43,6 +46,11 @@ func checkInvariants[K comparable, V any](t *testing.T, tbl *table[K, V]) {
 		}
 		occupied++
 		dib := dibOf(m)
+		// No tombstones by construction: meta is only ever 0 (empty) or an occupied
+		// encoding whose DIB fits the field; a sentinel/tombstone DIB would overflow it.
+		if dib > maxDib {
+			t.Fatalf("slot %d: dib %d exceeds maxDib %d (corrupt/tombstone meta)", i, dib, maxDib)
+		}
 		home := tbl.hashes[i] & tbl.capm1
 		wantDib := (i - home) & tbl.capm1
 		if uint64(dib) != wantDib {
@@ -63,6 +71,62 @@ func checkInvariants[K comparable, V any](t *testing.T, tbl *table[K, V]) {
 	}
 	if tbl.count > tbl.growAt {
 		t.Fatalf("count %d exceeds growAt %d (load factor over ~0.75)", tbl.count, tbl.growAt)
+	}
+
+	// Independent early-exit / no-hole pass: for every occupied slot, replay the
+	// lookup probe from its home and confirm each intermediate slot is occupied with
+	// DIB >= the probe distance. If a delete left a hole or a too-shallow resident on
+	// the chain, a real lookup for this key would early-exit before reaching it — so
+	// this walk is the direct structural witness that the key is still findable.
+	for i := uint64(0); i <= tbl.capm1; i++ {
+		if tbl.meta[i] == 0 {
+			continue
+		}
+		home := tbl.hashes[i] & tbl.capm1
+		for pd := uint64(0); (home+pd)&tbl.capm1 != i; pd++ {
+			s := (home + pd) & tbl.capm1
+			if tbl.meta[s] == 0 {
+				t.Fatalf("slot %d (home %d) unreachable: hole at probe slot %d", i, home, s)
+			}
+			if uint64(dibOf(tbl.meta[s])) < pd {
+				t.Fatalf("slot %d (home %d) unreachable: early-exit at slot %d (dib %d < probe %d)",
+					i, home, s, dibOf(tbl.meta[s]), pd)
+			}
+		}
+	}
+}
+
+// assertTablesEqual asserts two tables are structurally identical slot-for-slot
+// (meta/keys/vals/hashes) and share the same derived scalars. Used by the
+// delete-restores-as-if-never-inserted test, where backward-shift must reproduce
+// the exact layout a fresh insertion of the surviving keys would yield.
+func assertTablesEqual[K comparable, V comparable](t *testing.T, got, want *table[K, V]) {
+	t.Helper()
+	if got.count != want.count {
+		t.Fatalf("count = %d, want %d", got.count, want.count)
+	}
+	if got.capm1 != want.capm1 {
+		t.Fatalf("capm1 = %d, want %d", got.capm1, want.capm1)
+	}
+	if got.growAt != want.growAt {
+		t.Fatalf("growAt = %d, want %d", got.growAt, want.growAt)
+	}
+	for i := uint64(0); i <= got.capm1; i++ {
+		if got.meta[i] != want.meta[i] {
+			t.Fatalf("slot %d meta = %d, want %d", i, got.meta[i], want.meta[i])
+		}
+		if got.meta[i] == 0 {
+			continue // empty slot: key/val/hash content is irrelevant
+		}
+		if got.keys[i] != want.keys[i] {
+			t.Fatalf("slot %d key = %v, want %v", i, got.keys[i], want.keys[i])
+		}
+		if got.vals[i] != want.vals[i] {
+			t.Fatalf("slot %d val = %v, want %v", i, got.vals[i], want.vals[i])
+		}
+		if got.hashes[i] != want.hashes[i] {
+			t.Fatalf("slot %d hash = %d, want %d", i, got.hashes[i], want.hashes[i])
+		}
 	}
 }
 
@@ -365,6 +429,390 @@ func TestTable_DIBOverflowValve(t *testing.T) {
 	for i := 0; i < n; i++ {
 		if v, ok := tbl.lookup(uint64(i)<<9, i); !ok || v != i {
 			t.Fatalf("lookup(%d) = (%d, %v), want (%d, true) -- LOST KEY", i, v, ok, i)
+		}
+	}
+	checkInvariants(t, &tbl)
+}
+
+// ===========================================================================
+// Increment 3 — backward-shift delete + shrink
+// ===========================================================================
+
+// TestTable_DeleteBackwardShiftSpansBuckets deletes a key whose probe chain spans
+// several home buckets and asserts the backward-shift leaves no holes, no
+// tombstones, preserves DIB monotonicity, and keeps every surviving key findable
+// (spec "Backward-shift deletion leaves no holes or tombstones").
+func TestTable_DeleteBackwardShiftSpansBuckets(t *testing.T) {
+	tbl := newTable[string, int](0) // cap 8, capm1 7
+
+	// Synthetic homes build one contiguous run across buckets 2..6:
+	//   e@2(dib0) a@3(dib0) b@4(dib1) c@5(dib2) d@6(dib2)
+	type kv struct {
+		h uint64
+		k string
+	}
+	seq := []kv{
+		{3, "a"},  // home 3 -> slot 3, dib 0
+		{11, "b"}, // home 3 -> slot 4, dib 1
+		{19, "c"}, // home 3 -> slot 5, dib 2
+		{4, "d"},  // home 4 -> slot 6, dib 2
+		{2, "e"},  // home 2 -> slot 2, dib 0
+	}
+	for i, in := range seq {
+		tbl.insert(in.h, in.k, i)
+	}
+	checkInvariants(t, &tbl)
+
+	// Delete c (mid-chain, home 3, currently slot 5). d must shift back one slot
+	// with its DIB decremented; no tombstone, no hole.
+	got, ok := tbl.delete(19, "c")
+	if !ok || got != 2 {
+		t.Fatalf("delete(c) = (%d, %v), want (2, true)", got, ok)
+	}
+	if tbl.count != 4 {
+		t.Fatalf("count after delete = %d, want 4", tbl.count)
+	}
+	if _, ok := tbl.lookup(19, "c"); ok {
+		t.Fatalf("lookup(c) after delete = true, want false")
+	}
+	for _, in := range []kv{{3, "a"}, {11, "b"}, {4, "d"}, {2, "e"}} {
+		if _, ok := tbl.lookup(in.h, in.k); !ok {
+			t.Fatalf("survivor lookup(%q) = false, want true", in.k)
+		}
+	}
+	checkInvariants(t, &tbl) // no holes / no tombstones / DIB monotonic
+}
+
+// TestTable_DeleteRestoresAsIfNeverInserted pins the core backward-shift guarantee
+// (robin-hood deep dive §6): deleting a key leaves the table structurally identical
+// to one built without that key. Same-home keys preserve their relative chain order
+// under both fresh insertion and deletion shift, so the comparison is exact.
+func TestTable_DeleteRestoresAsIfNeverInserted(t *testing.T) {
+	// Four keys all homing to bucket 0 at cap 8: slots 0,1,2,3 with dib 0,1,2,3.
+	full := newTable[string, int](0)
+	keys := []struct {
+		h uint64
+		k string
+	}{{0, "k0"}, {8, "k1"}, {16, "k2"}, {24, "k3"}}
+	for i, in := range keys {
+		full.insert(in.h, in.k, i)
+	}
+
+	// Reference: the same keys minus k1, inserted in their original relative order.
+	ref := newTable[string, int](0)
+	ref.insert(0, "k0", 0)
+	ref.insert(16, "k2", 2)
+	ref.insert(24, "k3", 3)
+
+	if _, ok := full.delete(8, "k1"); !ok {
+		t.Fatalf("delete(k1) = false, want true")
+	}
+	assertTablesEqual(t, &full, &ref)
+	checkInvariants(t, &full)
+}
+
+// TestTable_DeleteThenReinsertRoundTrips checks observable equivalence after a
+// delete followed by a re-insert of the same key: every key is present with the
+// right value, the count is restored, and the invariants hold (the post-reinsert
+// layout may differ from the original, which is expected for order-dependent
+// same-home chains — only observable behavior is asserted here).
+func TestTable_DeleteThenReinsertRoundTrips(t *testing.T) {
+	tbl := newTable[string, int](0)
+	keys := []struct {
+		h uint64
+		k string
+	}{{0, "k0"}, {8, "k1"}, {16, "k2"}, {24, "k3"}}
+	for i, in := range keys {
+		tbl.insert(in.h, in.k, i)
+	}
+
+	if _, ok := tbl.delete(8, "k1"); !ok {
+		t.Fatalf("delete(k1) = false, want true")
+	}
+	tbl.insert(8, "k1", 1) // re-insert with the original value
+
+	if tbl.count != 4 {
+		t.Fatalf("count after delete+reinsert = %d, want 4", tbl.count)
+	}
+	for i, in := range keys {
+		if v, ok := tbl.lookup(in.h, in.k); !ok || v != i {
+			t.Fatalf("lookup(%q) = (%d, %v), want (%d, true)", in.k, v, ok, i)
+		}
+	}
+	checkInvariants(t, &tbl)
+}
+
+// TestTable_ShrinkTriggerHalvesCap drives the table up to a larger capacity, then
+// deletes enough entries to drop the load below ~0.25, and asserts the capacity
+// halves, all survivors persist, and the load factor stays bounded (the shrink
+// half of spec "Load factor stays bounded across grow and shrink").
+func TestTable_ShrinkTriggerHalvesCap(t *testing.T) {
+	tbl := newTable[string, int](0) // cap 8
+	// 25 inserts walk cap 8->16->32->64 (grow at count 6/12/24). count 25, cap 64.
+	const n = 25
+	for i := 0; i < n; i++ {
+		k := "s" + strconv.Itoa(i)
+		tbl.insert(fnv64(k), k, i)
+	}
+	if got := int(tbl.capm1) + 1; got != 64 {
+		t.Fatalf("capacity after %d inserts = %d, want 64", n, got)
+	}
+
+	// Delete down to count 15: load 15/64 < 0.25 trips a single halving to cap 32.
+	for i := n - 1; i >= 15; i-- {
+		k := "s" + strconv.Itoa(i)
+		if _, ok := tbl.delete(fnv64(k), k); !ok {
+			t.Fatalf("delete(%q) = false, want true", k)
+		}
+	}
+	if got := int(tbl.capm1) + 1; got != 32 {
+		t.Fatalf("capacity after shrink = %d, want 32 (halved from 64)", got)
+	}
+	if tbl.count != 15 {
+		t.Fatalf("count after deletes = %d, want 15", tbl.count)
+	}
+	for i := 0; i < 15; i++ {
+		k := "s" + strconv.Itoa(i)
+		if v, ok := tbl.lookup(fnv64(k), k); !ok || v != i {
+			t.Fatalf("survivor lookup(%q) = (%d, %v), want (%d, true)", k, v, ok, i)
+		}
+	}
+	if lf := float64(tbl.count) / float64(int(tbl.capm1)+1); lf > 0.75 {
+		t.Fatalf("load factor %.3f > 0.75 after shrink", lf)
+	}
+	checkInvariants(t, &tbl)
+}
+
+// TestTable_ShrinkHysteresisNoOscillation proves the wide grow(0.75)/shrink(0.25)
+// band keeps capacity stable when operations hover around a single threshold: a
+// fresh grow must not immediately shrink, a fresh shrink must not immediately
+// grow, and a long alternating insert/delete run must not bounce the capacity.
+func TestTable_ShrinkHysteresisNoOscillation(t *testing.T) {
+	tbl := newTable[string, int](0) // cap 8
+	// 13 inserts walk cap 8->16->32 (grow at count 6/12). count 13, cap 32.
+	for i := 0; i < 13; i++ {
+		k := "h" + strconv.Itoa(i)
+		tbl.insert(fnv64(k), k, i)
+	}
+	if got := int(tbl.capm1) + 1; got != 32 {
+		t.Fatalf("capacity = %d, want 32", got)
+	}
+
+	// A single delete right after a grow must NOT shrink (load 12/32 = 0.375 > 0.25).
+	if _, ok := tbl.delete(fnv64("h12"), "h12"); !ok {
+		t.Fatalf("delete(h12) = false, want true")
+	}
+	if got := int(tbl.capm1) + 1; got != 32 {
+		t.Fatalf("capacity after one post-grow delete = %d, want 32 (no shrink)", got)
+	}
+
+	// Alternate insert/delete of a transient key many times: count stays at 12/13,
+	// far from both the grow (24) and shrink (8) thresholds — cap must never move.
+	for i := 0; i < 200; i++ {
+		tbl.insert(fnv64("transient"), "transient", i)
+		if _, ok := tbl.delete(fnv64("transient"), "transient"); !ok {
+			t.Fatalf("delete(transient) iter %d = false, want true", i)
+		}
+		if got := int(tbl.capm1) + 1; got != 32 {
+			t.Fatalf("capacity oscillated to %d at iter %d, want stable 32", got, i)
+		}
+	}
+	checkInvariants(t, &tbl)
+}
+
+// --- TRIANGULATE -----------------------------------------------------------
+
+// TestTable_DeleteChainPositions deletes the head, middle, and tail of a single
+// same-home probe chain (each from a fresh table) and asserts every survivor is
+// still found and the invariants hold — backward-shift must repair the chain
+// regardless of which position is removed.
+func TestTable_DeleteChainPositions(t *testing.T) {
+	t.Parallel()
+
+	// Homes all bucket 0 at cap 8: slots 0,1,2,3 with dib 0,1,2,3.
+	keys := []struct {
+		h uint64
+		k string
+	}{{0, "k0"}, {8, "k1"}, {16, "k2"}, {24, "k3"}}
+
+	cases := []struct {
+		name    string
+		delH    uint64
+		delK    string
+		survive []string
+	}{
+		{"head", 0, "k0", []string{"k1", "k2", "k3"}},
+		{"mid", 16, "k2", []string{"k0", "k1", "k3"}},
+		{"tail", 24, "k3", []string{"k0", "k1", "k2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl := newTable[string, int](0)
+			for i, in := range keys {
+				tbl.insert(in.h, in.k, i)
+			}
+			if _, ok := tbl.delete(tc.delH, tc.delK); !ok {
+				t.Fatalf("delete(%q) = false, want true", tc.delK)
+			}
+			if _, ok := tbl.lookup(tc.delH, tc.delK); ok {
+				t.Fatalf("lookup(%q) after delete = true, want false", tc.delK)
+			}
+			if tbl.count != len(tc.survive) {
+				t.Fatalf("count = %d, want %d", tbl.count, len(tc.survive))
+			}
+			for _, k := range tc.survive {
+				var h uint64
+				for _, in := range keys {
+					if in.k == k {
+						h = in.h
+					}
+				}
+				if _, ok := tbl.lookup(h, k); !ok {
+					t.Fatalf("survivor lookup(%q) = false, want true", k)
+				}
+			}
+			checkInvariants(t, &tbl)
+		})
+	}
+}
+
+// TestTable_DeleteLastAndAbsent covers the degenerate ends: deleting the only
+// remaining key empties the table (count 0, reads absent, cap floored at minCap),
+// and deleting an absent key reports false and changes nothing.
+func TestTable_DeleteLastAndAbsent(t *testing.T) {
+	t.Parallel()
+
+	tbl := newTable[string, int](0)
+	tbl.insert(fnv64("only"), "only", 7)
+
+	// Absent key: no change, ok == false, zero value.
+	if v, ok := tbl.delete(fnv64("ghost"), "ghost"); ok || v != 0 {
+		t.Fatalf("delete(ghost) = (%d, %v), want (0, false)", v, ok)
+	}
+	if tbl.count != 1 {
+		t.Fatalf("count after absent delete = %d, want 1", tbl.count)
+	}
+
+	// Last remaining key: table goes empty, cap stays at minCap (cannot shrink below).
+	if v, ok := tbl.delete(fnv64("only"), "only"); !ok || v != 7 {
+		t.Fatalf("delete(only) = (%d, %v), want (7, true)", v, ok)
+	}
+	if tbl.count != 0 {
+		t.Fatalf("count after deleting last key = %d, want 0", tbl.count)
+	}
+	if _, ok := tbl.lookup(fnv64("only"), "only"); ok {
+		t.Fatalf("lookup(only) after delete = true, want false")
+	}
+	if got := int(tbl.capm1) + 1; got != minCap {
+		t.Fatalf("capacity = %d, want minCap %d (no shrink below floor)", got, minCap)
+	}
+	// Deleting from the now-empty table is a clean miss.
+	if _, ok := tbl.delete(fnv64("only"), "only"); ok {
+		t.Fatalf("second delete(only) = true, want false")
+	}
+	checkInvariants(t, &tbl)
+}
+
+// TestTable_MassDeleteThenRegrow inserts a large set, deletes every entry (driving
+// repeated shrinks down to minCap), then re-inserts a fresh set — proving the
+// shrink path and a subsequent regrow both preserve all entries with no leftover
+// state from the emptied table.
+func TestTable_MassDeleteThenRegrow(t *testing.T) {
+	t.Parallel()
+
+	tbl := newTable[string, int](0)
+	const n = 100
+	for i := 0; i < n; i++ {
+		k := "m" + strconv.Itoa(i)
+		tbl.insert(fnv64(k), k, i)
+	}
+	checkInvariants(t, &tbl)
+
+	for i := 0; i < n; i++ {
+		k := "m" + strconv.Itoa(i)
+		if _, ok := tbl.delete(fnv64(k), k); !ok {
+			t.Fatalf("delete(%q) = false, want true", k)
+		}
+	}
+	if tbl.count != 0 {
+		t.Fatalf("count after mass delete = %d, want 0", tbl.count)
+	}
+	if got := int(tbl.capm1) + 1; got != minCap {
+		t.Fatalf("capacity after mass delete = %d, want minCap %d", got, minCap)
+	}
+	checkInvariants(t, &tbl)
+
+	// Regrow from empty: a fresh set must round-trip and grow cleanly.
+	for i := 0; i < n; i++ {
+		k := "r" + strconv.Itoa(i)
+		tbl.insert(fnv64(k), k, i*2)
+	}
+	if tbl.count != n {
+		t.Fatalf("count after regrow = %d, want %d", tbl.count, n)
+	}
+	for i := 0; i < n; i++ {
+		k := "r" + strconv.Itoa(i)
+		if v, ok := tbl.lookup(fnv64(k), k); !ok || v != i*2 {
+			t.Fatalf("lookup(%q) = (%d, %v), want (%d, true)", k, v, ok, i*2)
+		}
+	}
+	// No stale survivors from the deleted generation.
+	for i := 0; i < n; i++ {
+		k := "m" + strconv.Itoa(i)
+		if _, ok := tbl.lookup(fnv64(k), k); ok {
+			t.Fatalf("stale lookup(%q) = true, want false", k)
+		}
+	}
+	checkInvariants(t, &tbl)
+}
+
+// TestTable_RandomizedDeletesAgainstMapOracle is the increment-3 model-equivalence
+// gate: a long randomized Set/Get/Delete stream is mirrored against a reference Go
+// map and the structural invariants are re-checked throughout. This is the
+// reviewer-mandated guard that the backward-shift stop condition keeps probe chains
+// contiguous and the early-exit invariant intact (no silent key loss / no
+// duplicate-insert regression).
+func TestTable_RandomizedDeletesAgainstMapOracle(t *testing.T) {
+	const (
+		ops      = 40000
+		keySpace = 256 // small enough to force collisions, overwrites, and re-inserts
+	)
+	rng := rand.New(rand.NewSource(0xD15EA5E))
+	tbl := newTable[string, int](0)
+	model := make(map[string]int)
+
+	for n := 0; n < ops; n++ {
+		key := "key" + strconv.Itoa(rng.Intn(keySpace))
+		switch rng.Intn(10) {
+		case 0, 1, 2, 3, 4: // bias toward writes so the table fills and grows
+			val := rng.Int()
+			tbl.insert(fnv64(key), key, val)
+			model[key] = val
+		case 5, 6, 7: // delete: compare presence reporting against the model
+			_, want := model[key]
+			_, got := tbl.delete(fnv64(key), key)
+			if got != want {
+				t.Fatalf("op %d delete(%q) existed = %v, want %v", n, key, got, want)
+			}
+			delete(model, key)
+		default: // lookup
+			wantV, wantOK := model[key]
+			gotV, gotOK := tbl.lookup(fnv64(key), key)
+			if gotOK != wantOK || (wantOK && gotV != wantV) {
+				t.Fatalf("op %d lookup(%q) = (%d, %v), want (%d, %v)", n, key, gotV, gotOK, wantV, wantOK)
+			}
+		}
+		if n%250 == 0 {
+			checkInvariants(t, &tbl)
+		}
+	}
+
+	if tbl.count != len(model) {
+		t.Fatalf("final count = %d, want %d", tbl.count, len(model))
+	}
+	for k, want := range model {
+		if got, ok := tbl.lookup(fnv64(k), k); !ok || got != want {
+			t.Fatalf("final lookup(%q) = (%d, %v), want (%d, true)", k, got, ok, want)
 		}
 	}
 	checkInvariants(t, &tbl)

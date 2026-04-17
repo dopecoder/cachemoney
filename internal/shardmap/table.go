@@ -48,6 +48,13 @@ const (
 	// loadNum/loadDen express the ~0.75 grow threshold as growAt = cap*3/4.
 	loadNum = 3
 	loadDen = 4
+
+	// shrinkNum/shrinkDen express the ~0.25 shrink threshold as shrinkBelow = cap/4.
+	// The wide hysteresis band (grow at 3/4, shrink at 1/4) keeps a delete that drops
+	// the load just below 1/4 from landing above 3/4 after halving, so capacity never
+	// oscillates when operations hover around a single threshold (design §10).
+	shrinkNum = 1
+	shrinkDen = 4
 )
 
 // table is one open-addressing Robin Hood hashmap held as a structure-of-arrays
@@ -209,7 +216,7 @@ func (t *table[K, V]) grow() {
 
 // resize reallocates the table to newCap (a power of two) and reinserts all live
 // entries from the old arrays using their cached hashes. It is the shared
-// reinsert path for grow (and, in a later increment, shrink).
+// reinsert path for grow and shrink.
 func (t *table[K, V]) resize(newCap int) {
 	src := *t
 	t.alloc(newCap)
@@ -218,4 +225,78 @@ func (t *table[K, V]) resize(newCap int) {
 			t.set(src.hashes[i], src.keys[i], src.vals[i])
 		}
 	}
+}
+
+// delete removes the entry stored under key (identified by its precomputed hash),
+// returning the removed value and whether the key was present. It locates the key
+// with the same probe rule as lookup (stop on match, empty, or the Robin Hood
+// early-exit), then repairs the chain by backward-shift deletion: each following
+// displaced entry is moved back one slot with its DIB decremented, stopping at an
+// empty slot or an entry already in its home slot (DIB 0, which must not move).
+// This leaves no tombstones and keeps probe chains contiguous and DIB-monotonic —
+// exactly the state the table would hold had the key never been inserted
+// (robin-hood deep dive §6). A delete that drops the load below ~0.25 shrinks.
+func (t *table[K, V]) delete(hash uint64, key K) (V, bool) {
+	frag := fragOf(hash)
+	i := t.home(hash)
+	var dib uint16
+	for {
+		m := t.meta[i]
+		if m == 0 || dib > dibOf(m) {
+			// Empty slot or early-exit: had the key been present it would have robbed
+			// this slot on insert, so it cannot be here.
+			var zero V
+			return zero, false
+		}
+		if m&fragMask == frag && t.keys[i] == key {
+			break // found at slot i
+		}
+		i = (i + 1) & t.capm1
+		dib++
+	}
+
+	removed := t.vals[i]
+
+	// Backward-shift: walk forward pulling each following displaced entry back one
+	// slot and decrementing its DIB, until an empty slot or a home (DIB 0) entry.
+	j := (i + 1) & t.capm1
+	for t.meta[j] != 0 && dibOf(t.meta[j]) > 0 {
+		t.meta[i] = packMeta(dibOf(t.meta[j])-1, t.meta[j]&fragMask)
+		t.keys[i] = t.keys[j]
+		t.vals[i] = t.vals[j]
+		t.hashes[i] = t.hashes[j]
+		i = j
+		j = (j + 1) & t.capm1
+	}
+
+	// Vacate the tail slot and drop the K/V references so the GC can reclaim them:
+	// the slot arrays outlive individual entries, so a stale copy would leak
+	// (design §9 copy-on-write keeps stored bytes immutable, never reused in place).
+	var zeroK K
+	var zeroV V
+	t.meta[i] = 0
+	t.keys[i] = zeroK
+	t.vals[i] = zeroV
+	t.hashes[i] = 0
+	t.count--
+
+	t.shrink()
+	return removed, true
+}
+
+// shrink halves the table when a delete has dropped the live count below ~0.25 of
+// capacity and the capacity is above minCap, reinserting survivors through the
+// same cached-hash resize path as grow. The 1/4 shrink threshold sits well below
+// the 3/4 grow threshold so capacity cannot thrash (design §10).
+func (t *table[K, V]) shrink() {
+	curCap := len(t.meta)
+	if curCap <= minCap {
+		return
+	}
+	if t.count >= curCap*shrinkNum/shrinkDen {
+		return
+	}
+	// curCap is a power of two greater than minCap, so curCap >= 2*minCap and
+	// newCap = curCap/2 >= minCap — the floor is guaranteed, no clamp needed.
+	t.resize(curCap / 2)
 }

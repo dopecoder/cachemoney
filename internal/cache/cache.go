@@ -92,39 +92,58 @@ func New(opts ...Option) *Cache {
 // Get returns a defensive copy of the live value stored under key. ok is false
 // when the key is absent or expired.
 //
-// Increment 6 is the engine skeleton: this method wires the single ctx.Err() entry
-// check and returns zero values. The real lookup — lazy-TTL expiry and the
-// defensive out-copy taken after the shard read lock is released — is wired in
-// increment 7.
+// The lookup takes the backing shard's read lock internally (via shardmap.Get) and
+// returns the entry by value; expiry is then evaluated with the injected clock
+// (lazy TTL — an expired entry reads as absent and is NOT removed on read). The
+// defensive out-copy is taken AFTER shardmap has released its read lock: that is
+// race-free because shardmap never mutates a stored value's backing array in place
+// (copy-on-write invariant, design §9), and it keeps the lock hold time to the bare
+// map probe.
 func (c *Cache) Get(ctx context.Context, key string) (value []byte, ok bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	return nil, false, nil
+	e, found := c.m.Get(key)
+	if !found || c.expired(e) {
+		return nil, false, nil
+	}
+	return cloneBytes(e.value), true, nil
 }
 
 // Set stores a defensive copy of value under key with an optional TTL, overwriting
 // any existing entry.
 //
-// Increment 6 skeleton: the ctx.Err() entry check returns before any lock or
-// mutation, so a cancelled Set stores nothing. The defensive in-copy, expiresAt
-// computation, and shardmap insert are wired in increment 7.
+// The ctx.Err() entry check returns before any lock or mutation, so a cancelled Set
+// stores nothing (design §8). The input is cloned BEFORE the shardmap insert so the
+// map always holds a private copy — mutating the caller's slice afterward cannot
+// reach storage. expiresAt is computed from the injected clock when ttl > 0; a
+// ttl <= 0 yields a zero expiresAt, meaning the entry never expires.
 func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	e := entry{value: cloneBytes(value)}
+	if ttl > 0 {
+		e.expiresAt = c.now().Add(ttl)
+	}
+	c.m.Set(key, e)
 	return nil
 }
 
 // Del removes key, reporting whether it was present and live at deletion time.
 //
-// Increment 6 skeleton: the ctx.Err() entry check only. The shardmap delete and
-// liveness result are wired in increment 7.
+// An expired entry is still physically removed but reported existed == false (it
+// was present in storage but not live), matching the original store semantics. An
+// absent key reports existed == false.
 func (c *Cache) Del(ctx context.Context, key string) (existed bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	return false, nil
+	e, found := c.m.Delete(key)
+	if !found {
+		return false, nil
+	}
+	return !c.expired(e), nil
 }
 
 // TTL reports the remaining lifetime of a live key (-1 for a live key with no
@@ -141,11 +160,41 @@ func (c *Cache) TTL(ctx context.Context, key string) (remaining time.Duration, o
 
 // Len returns the number of live (non-expired) entries.
 //
-// Increment 6 skeleton: the ctx.Err() entry check only. The Range-based live count
-// (see the package doc's iteration / re-entrancy contract) is wired in increment 7.
+// It scans the backing map with shardmap.Range, which holds each shard's read lock
+// for the duration of that shard's walk and is per-shard-consistent rather than a
+// single global snapshot (see the package doc's iteration / re-entrancy contract).
+// The callback only reads entry expiry and never mutates, and it never calls back
+// into this Cache (which would deadlock on the held read lock). Entries whose TTL
+// has elapsed but whose memory has not been reclaimed are excluded (lazy TTL).
 func (c *Cache) Len(ctx context.Context) (n int, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	return 0, nil
+	count := 0
+	c.m.Range(func(_ string, e entry) bool {
+		if !c.expired(e) {
+			count++
+		}
+		return true
+	})
+	return count, nil
+}
+
+// expired reports whether e has passed its expiry as of the current clock time. A
+// zero expiresAt (set with ttl <= 0) never expires. This is byte-for-byte the rule
+// the original store used, so every TTL boundary behavior carries over unchanged.
+func (c *Cache) expired(e entry) bool {
+	return !e.expiresAt.IsZero() && !c.now().Before(e.expiresAt)
+}
+
+// cloneBytes returns a copy of b. A nil input yields an empty, non-nil slice so
+// stored values are always addressable and round-trip identically (a nil value set
+// reads back as a length-0 non-nil slice). The engine clones on the way in (before
+// shardmap.Set) and on the way out (after the shard read lock is released); the
+// out-copy is sound outside the lock because shardmap never mutates a stored value's
+// backing array in place (copy-on-write invariant, design §9).
+func cloneBytes(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
 }

@@ -118,6 +118,12 @@ func (c *Cache) Get(ctx context.Context, key string) (value []byte, ok bool, err
 // map always holds a private copy — mutating the caller's slice afterward cannot
 // reach storage. expiresAt is computed from the injected clock when ttl > 0; a
 // ttl <= 0 yields a zero expiresAt, meaning the entry never expires.
+//
+// Accepted TOCTOU nuance (design §8): the entry check honors an already-cancelled
+// context, but a context cancelled BETWEEN the check and the shardmap insert still
+// completes the store. This is the standard "honor cancellation at entry" contract
+// and is acceptable for these nanosecond-scale O(1) ops; longer M1/M3 operations can
+// add deadline-aware checks at their own slow points.
 func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -146,16 +152,28 @@ func (c *Cache) Del(ctx context.Context, key string) (existed bool, err error) {
 	return !c.expired(e), nil
 }
 
-// TTL reports the remaining lifetime of a live key (-1 for a live key with no
-// expiry), with ok false for an absent or expired key.
+// TTL reports the remaining lifetime of a live key. ok is false for an absent or
+// expired key; a live key with no expiry returns the Redis-style sentinel remaining
+// of -1. TTL is read-only — like Get it takes the backing shard's read lock (via
+// shardmap.Get) and never mutates stored state: an entry whose TTL has elapsed reads
+// as absent and is NOT reclaimed on the read (lazy expiry, design §7).
 //
-// Increment 6 skeleton: the ctx.Err() entry check only. The remaining-lifetime
-// computation is wired in increment 8.
+// The single ctx.Err() entry check runs before the shard lock (uniform with the
+// other four ops), so a cancelled TTL touches nothing. For a live key with an
+// expiry, remaining is expiresAt.Sub(now()), guaranteed > 0 because the prior
+// expired() check already excluded the at/after-expiry instant.
 func (c *Cache) TTL(ctx context.Context, key string) (remaining time.Duration, ok bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, false, err
 	}
-	return 0, false, nil
+	e, found := c.m.Get(key)
+	if !found || c.expired(e) {
+		return 0, false, nil
+	}
+	if e.expiresAt.IsZero() {
+		return -1, true, nil
+	}
+	return e.expiresAt.Sub(c.now()), true, nil
 }
 
 // Len returns the number of live (non-expired) entries.

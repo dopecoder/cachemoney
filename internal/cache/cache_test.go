@@ -3,6 +3,7 @@ package cache_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"math/rand"
 	"strconv"
 	"sync"
@@ -671,5 +672,233 @@ func TestCache_ModelEquivalence(t *testing.T) {
 		if gotN, err := c.Len(ctx); err != nil || gotN != ref.length() {
 			t.Fatalf("op %d Len = %d (err %v), want %d", i, gotN, err, ref.length())
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Increment 8 — TTL(key) read op (Redis-style) + full cancellation matrix.
+// Satisfies spec *TTL read operation* (4 scenarios), *Context cancellation is
+// honored* (the "stores nothing" + live-ctx halves), and completes *Successful
+// in-memory ops return nil error* (design §7 TTL semantics, §8 ctx/TOCTOU).
+// ---------------------------------------------------------------------------
+
+// TestCache_TTLLiveKeyWithExpiry — spec "Live key with an expiry reports positive
+// remaining". Set ttl=100ms, advance the fake clock +40ms; TTL reports ok and a
+// positive remaining in (0, 100ms] — deterministically ~60ms under the fake clock.
+func TestCache_TTLLiveKeyWithExpiry(t *testing.T) {
+	clk := newFakeClock()
+	c := cache.New(cache.WithClock(clk.now))
+	ctx := context.Background()
+
+	const ttl = 100 * time.Millisecond
+	if err := c.Set(ctx, "k", []byte("v"), ttl); err != nil {
+		t.Fatalf("Set err = %v", err)
+	}
+	clk.advance(40 * time.Millisecond)
+
+	remaining, ok, err := c.TTL(ctx, "k")
+	if err != nil {
+		t.Fatalf("TTL err = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("TTL ok = false, want true")
+	}
+	if remaining <= 0 || remaining > ttl {
+		t.Errorf("TTL remaining = %v, want 0 < remaining <= %v", remaining, ttl)
+	}
+	if want := 60 * time.Millisecond; remaining != want {
+		t.Errorf("TTL remaining = %v, want exactly %v (deterministic fake clock)", remaining, want)
+	}
+}
+
+// TestCache_TTLLiveKeyNoExpiry — spec "Live key with no expiry returns the -1
+// sentinel". A key set with ttl=0 reports remaining == -1, ok == true.
+func TestCache_TTLLiveKeyNoExpiry(t *testing.T) {
+	clk := newFakeClock()
+	c := cache.New(cache.WithClock(clk.now))
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", []byte("v"), 0); err != nil {
+		t.Fatalf("Set err = %v", err)
+	}
+
+	remaining, ok, err := c.TTL(ctx, "k")
+	if err != nil {
+		t.Fatalf("TTL err = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("TTL ok = false, want true")
+	}
+	if remaining != -1 {
+		t.Errorf("TTL remaining = %v, want -1 (Redis-style no-expiry sentinel)", remaining)
+	}
+}
+
+// TestCache_TTLAbsentKey — spec "Absent key reports not found".
+func TestCache_TTLAbsentKey(t *testing.T) {
+	c := cache.New()
+
+	remaining, ok, err := c.TTL(context.Background(), "absent")
+	if err != nil {
+		t.Fatalf("TTL err = %v, want nil", err)
+	}
+	if ok {
+		t.Errorf("TTL(absent) ok = true, want false")
+	}
+	if remaining != 0 {
+		t.Errorf("TTL(absent) remaining = %v, want 0", remaining)
+	}
+}
+
+// TestCache_TTLExpiredKey — spec "Expired key reports not found". A key advanced
+// past its expiry reports ok == false (lazy expiry; the TTL read never reclaims).
+func TestCache_TTLExpiredKey(t *testing.T) {
+	clk := newFakeClock()
+	c := cache.New(cache.WithClock(clk.now))
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", []byte("v"), 100*time.Millisecond); err != nil {
+		t.Fatalf("Set err = %v", err)
+	}
+	clk.advance(150 * time.Millisecond) // well past expiry
+
+	remaining, ok, err := c.TTL(ctx, "k")
+	if err != nil {
+		t.Fatalf("TTL err = %v, want nil", err)
+	}
+	if ok {
+		t.Errorf("TTL(expired) ok = true, want false")
+	}
+	if remaining != 0 {
+		t.Errorf("TTL(expired) remaining = %v, want 0", remaining)
+	}
+}
+
+// TestCache_TTLDoesNotMutate — TTL is read-only: Len, the stored value, and the
+// key's liveness are unchanged after repeated TTL calls (lazy expiry never reclaims
+// on a read, matching Get).
+func TestCache_TTLDoesNotMutate(t *testing.T) {
+	clk := newFakeClock()
+	c := cache.New(cache.WithClock(clk.now))
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", []byte("v"), 100*time.Millisecond); err != nil {
+		t.Fatalf("Set k err = %v", err)
+	}
+	if err := c.Set(ctx, "other", []byte("x"), 0); err != nil {
+		t.Fatalf("Set other err = %v", err)
+	}
+
+	lenBefore, err := c.Len(ctx)
+	if err != nil {
+		t.Fatalf("Len before err = %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, ok, err := c.TTL(ctx, "k"); err != nil || !ok {
+			t.Fatalf("TTL #%d ok = %v, err = %v, want true/nil", i, ok, err)
+		}
+	}
+
+	lenAfter, err := c.Len(ctx)
+	if err != nil {
+		t.Fatalf("Len after err = %v", err)
+	}
+	if lenAfter != lenBefore {
+		t.Errorf("Len mutated by TTL: before %d, after %d", lenBefore, lenAfter)
+	}
+
+	got, ok, err := c.Get(ctx, "k")
+	if err != nil || !ok {
+		t.Fatalf("Get after TTL ok = %v, err = %v, want true/nil", ok, err)
+	}
+	if diff := cmp.Diff([]byte("v"), got); diff != "" {
+		t.Errorf("value mutated by TTL (-want +got):\n%s", diff)
+	}
+}
+
+// TestCache_CancelledSetStoresNothing — spec "Cancelled context on a mutation
+// returns ctx.Err() without applying" (reviewer carry-forward). A Set on an
+// already-cancelled context returns ctx.Err() AND must store nothing — a later
+// live-ctx Get reads absent and Len stays zero.
+func TestCache_CancelledSetStoresNothing(t *testing.T) {
+	c := cache.New()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := c.Set(cancelled, "k", []byte("v"), 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Set(cancelled) err = %v, want context.Canceled", err)
+	}
+
+	// A later live-ctx Get proves the cancelled Set never stored the key.
+	got, ok, err := c.Get(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("Get(live) err = %v, want nil", err)
+	}
+	if ok {
+		t.Errorf("Get after cancelled Set ok = true (value %q), want false — cancelled Set must store nothing", got)
+	}
+	if n, err := c.Len(context.Background()); err != nil || n != 0 {
+		t.Errorf("Len after cancelled Set = %d (err %v), want 0", n, err)
+	}
+}
+
+// TestCache_TTLBoundary (TRIANGULATE) — TTL exactly at the expiry boundary: live
+// with remaining == 1ms at +99ms, gone (ok == false) at +100ms, mirroring the Get
+// boundary in TestCache_TTLExpiry.
+func TestCache_TTLBoundary(t *testing.T) {
+	clk := newFakeClock()
+	c := cache.New(cache.WithClock(clk.now))
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", []byte("v"), 100*time.Millisecond); err != nil {
+		t.Fatalf("Set err = %v", err)
+	}
+
+	clk.advance(99 * time.Millisecond) // just before expiry
+	remaining, ok, err := c.TTL(ctx, "k")
+	if err != nil || !ok {
+		t.Fatalf("TTL at +99ms ok = %v, err = %v, want true/nil", ok, err)
+	}
+	if want := 1 * time.Millisecond; remaining != want {
+		t.Errorf("TTL at +99ms remaining = %v, want %v", remaining, want)
+	}
+
+	clk.advance(1 * time.Millisecond) // exactly at the expiry instant (+100ms)
+	if remaining, ok, err := c.TTL(ctx, "k"); err != nil || ok || remaining != 0 {
+		t.Errorf("TTL at +100ms = (%v, %v, %v), want (0, false, nil)", remaining, ok, err)
+	}
+}
+
+// TestCache_TTLAfterOverwriteResetsRemaining (TRIANGULATE) — re-Setting a key with
+// a fresh TTL rebases the expiry on the current clock, so a subsequent TTL reflects
+// the NEW lifetime; re-Setting with ttl=0 clears the expiry to the -1 sentinel.
+func TestCache_TTLAfterOverwriteResetsRemaining(t *testing.T) {
+	clk := newFakeClock()
+	c := cache.New(cache.WithClock(clk.now))
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", []byte("first"), 100*time.Millisecond); err != nil {
+		t.Fatalf("Set first err = %v", err)
+	}
+	clk.advance(40 * time.Millisecond)
+	if remaining, ok, err := c.TTL(ctx, "k"); err != nil || !ok || remaining != 60*time.Millisecond {
+		t.Fatalf("TTL before overwrite = (%v, %v, %v), want (60ms, true, nil)", remaining, ok, err)
+	}
+
+	// Overwrite with a fresh 100ms TTL rebased on the current clock.
+	if err := c.Set(ctx, "k", []byte("second"), 100*time.Millisecond); err != nil {
+		t.Fatalf("Set second err = %v", err)
+	}
+	if remaining, ok, err := c.TTL(ctx, "k"); err != nil || !ok || remaining != 100*time.Millisecond {
+		t.Errorf("TTL after overwrite = (%v, %v, %v), want (100ms, true, nil) — TTL not reset", remaining, ok, err)
+	}
+
+	// Re-Set with ttl=0 clears the expiry → -1 sentinel.
+	if err := c.Set(ctx, "k", []byte("third"), 0); err != nil {
+		t.Fatalf("Set third err = %v", err)
+	}
+	if remaining, ok, err := c.TTL(ctx, "k"); err != nil || !ok || remaining != -1 {
+		t.Errorf("TTL after re-Set ttl=0 = (%v, %v, %v), want (-1, true, nil)", remaining, ok, err)
 	}
 }

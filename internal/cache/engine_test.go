@@ -122,11 +122,12 @@ func TestNew_AcceptsOptions(t *testing.T) {
 	var _ cache.Engine = c
 }
 
-// TestOps_CancelledContextReturnsErr smoke-tests the single ctx.Err() entry check
-// wired into all five ops: an already-cancelled context makes every operation
-// return ctx.Err() (here context.Canceled). The full cancellation matrix (and the
-// "stores nothing" guarantee) lands in increment 8; this only proves the entry
-// check is present and uniform.
+// TestOps_CancelledContextReturnsErr asserts the single ctx.Err() entry check is
+// uniform across all five ops: an already-cancelled context makes every operation
+// return ctx.Err() (here context.Canceled), before any lock or mutation. Together
+// with TestOps_ExpiredDeadlineReturnsErr (DeadlineExceeded) this is the full
+// cancellation matrix; the "a cancelled Set stores nothing" guarantee is proven
+// behaviorally by TestCache_CancelledSetStoresNothing (increment 8).
 func TestOps_CancelledContextReturnsErr(t *testing.T) {
 	c := cache.New()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -175,27 +176,38 @@ func TestOps_ExpiredDeadlineReturnsErr(t *testing.T) {
 	}
 }
 
-// TestOps_LiveContextReturnsNilError is the skeleton of the spec scenario
-// "Successful in-memory ops return nil error": with a live context every op
-// returns a nil error. (The stub bodies return zero values; the real read/write
-// effects arrive in increments 7–8.)
+// TestOps_LiveContextReturnsNilError realizes the spec scenario "Live context
+// succeeds with nil error": with a live context every op returns a nil error AND
+// its effect is observable. (Increment 6 only checked the nil error against stub
+// bodies; increments 7–8 wired the real read/write/TTL effects, so this now also
+// asserts each op takes effect.)
 func TestOps_LiveContextReturnsNilError(t *testing.T) {
 	c := cache.New()
 	ctx := context.Background()
 
-	if _, _, err := c.Get(ctx, "k"); err != nil {
-		t.Errorf("Get live err = %v, want nil", err)
-	}
+	// Set returns nil and takes effect: a later Get observes the stored value.
 	if err := c.Set(ctx, "k", []byte("v"), 0); err != nil {
 		t.Errorf("Set live err = %v, want nil", err)
 	}
-	if _, err := c.Del(ctx, "k"); err != nil {
-		t.Errorf("Del live err = %v, want nil", err)
+	if got, ok, err := c.Get(ctx, "k"); err != nil || !ok || string(got) != "v" {
+		t.Errorf("Get live = (%q, %v, %v), want (\"v\", true, nil) — Set did not take effect", got, ok, err)
 	}
-	if _, _, err := c.TTL(ctx, "k"); err != nil {
-		t.Errorf("TTL live err = %v, want nil", err)
+
+	// TTL of the live no-expiry key returns the -1 sentinel with a nil error.
+	if remaining, ok, err := c.TTL(ctx, "k"); err != nil || !ok || remaining != -1 {
+		t.Errorf("TTL live = (%v, %v, %v), want (-1, true, nil)", remaining, ok, err)
 	}
-	if _, err := c.Len(ctx); err != nil {
-		t.Errorf("Len live err = %v, want nil", err)
+
+	// Len returns nil and observes the one live entry.
+	if n, err := c.Len(ctx); err != nil || n != 1 {
+		t.Errorf("Len live = (%d, %v), want (1, nil)", n, err)
+	}
+
+	// Del returns nil and takes effect: existed == true, then the key reads absent.
+	if existed, err := c.Del(ctx, "k"); err != nil || !existed {
+		t.Errorf("Del live = (%v, %v), want (true, nil)", existed, err)
+	}
+	if _, ok, err := c.Get(ctx, "k"); err != nil || ok {
+		t.Errorf("Get after Del live ok = %v, err = %v, want false/nil — Del did not take effect", ok, err)
 	}
 }

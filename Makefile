@@ -11,6 +11,8 @@ BINARY        := $(BIN_DIR)/cachemoney
 PKG           := ./...
 MAIN_PKG      := ./cmd/cachemoney
 COVER_PROFILE := coverage.txt
+BENCHTIME     ?= 300ms
+FUZZTIME      ?= 20s
 
 # Inject version metadata at build time.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -67,6 +69,22 @@ race:
 cover:
 	$(GO) test -race -covermode=atomic -coverprofile=$(COVER_PROFILE) $(PKG)
 	$(GO) tool cover -func=$(COVER_PROFILE) | tail -1
+
+## cover-html: Write an HTML coverage report to coverage.html.
+.PHONY: cover-html
+cover-html: cover
+	$(GO) tool cover -html=$(COVER_PROFILE) -o coverage.html
+	@echo "wrote coverage.html"
+
+## bench: Run benchmarks (sharded map vs stdlib map+RWMutex). BENCHTIME?=300ms.
+.PHONY: bench
+bench:
+	$(GO) test -run='^$$' -bench=. -benchmem -benchtime=$(BENCHTIME) ./internal/shardmap
+
+## fuzz: Run the shardmap model-equivalence fuzzer. FUZZTIME?=20s.
+.PHONY: fuzz
+fuzz:
+	$(GO) test -run='^$$' -fuzz=FuzzMapModelEquivalence -fuzztime=$(FUZZTIME) ./internal/shardmap
 
 ## build: Build the cachemoney binary.
 .PHONY: build

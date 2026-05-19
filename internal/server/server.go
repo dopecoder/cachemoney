@@ -23,6 +23,11 @@ type Server struct {
 
 	ln net.Listener
 
+	// sem is a counting semaphore bounding concurrent served connections to
+	// cfg.MaxConns. The accept loop sends on it before serving a connection and
+	// the serve goroutine receives from it when the connection ends.
+	sem chan struct{}
+
 	mu    sync.Mutex
 	conns map[*conn]struct{}
 
@@ -34,10 +39,12 @@ type Server struct {
 // so it is an explicit argument rather than a Config field. New does not bind a
 // socket.
 func New(engine cache.Engine, cfg Config) *Server {
+	cfg = cfg.defaults()
 	return &Server{
 		engine: engine,
-		cfg:    cfg.defaults(),
+		cfg:    cfg,
 		conns:  make(map[*conn]struct{}),
+		sem:    make(chan struct{}, cfg.MaxConns),
 	}
 }
 
@@ -77,10 +84,32 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		c := s.newConn(nc)
-		s.addConn(c)
-		go s.serveConn(c)
+		// Accept first, then try to acquire a slot. A full semaphore means the
+		// max-connections cap is reached: refuse politely in a separate goroutine
+		// so the accept loop is never wedged and existing connections keep serving.
+		select {
+		case s.sem <- struct{}{}:
+			c := s.newConn(nc)
+			s.addConn(c)
+			go func() {
+				defer func() { <-s.sem }() // free the slot when the connection ends
+				s.serveConn(c)
+			}()
+		default:
+			go s.rejectConn(nc)
+		}
 	}
+}
+
+// rejectConn politely refuses a connection accepted past the max-connections cap:
+// it writes the Redis-style notice and closes the socket. It never acquired a
+// semaphore slot, so it releases nothing. It runs in its own goroutine so the
+// accept loop returns immediately to Accept the next connection.
+func (s *Server) rejectConn(nc net.Conn) {
+	w := resp.NewWriter(nc)
+	_ = w.WriteError("ERR max number of clients reached")
+	_ = w.Flush()
+	_ = nc.Close()
 }
 
 // newConn builds a per-connection state object with its own codec reader/writer.

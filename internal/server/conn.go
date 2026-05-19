@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/dopecoder/cachemoney/internal/resp"
 )
@@ -68,6 +69,16 @@ func (s *Server) serveConn(c *conn) {
 			return
 		}
 		c.active.Store(false) // blocked on read == idle (shutdown may close us)
+		if s.cfg.IdleTimeout > 0 {
+			// Reset the deadline before every read so the timeout is idle
+			// (since-last-byte), not a total connection lifetime. A read that
+			// exceeds it returns a transport error, which classify maps to a
+			// silent close.
+			// Socket deadlines are interpreted against the OS wall/monotonic clock,
+			// which is a different domain from cfg.Now (the injectable cache clock
+			// used for TTL math); use real time here.
+			_ = c.nc.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
+		}
 		args, err := c.r.ReadCommand()
 		c.active.Store(true) // a frame arrived: we are now in flight
 		if err != nil {

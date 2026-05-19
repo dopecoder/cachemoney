@@ -10,18 +10,27 @@ type command struct {
 	handler func(c *conn, args [][]byte) error
 }
 
-// commandTable maps an upper-cased command name to its command. It is built once
-// at package init; a new command is one row plus one handler.
-//
-// In PR A this is the core set. SET is plain-only (arity [3,3]) and DEL is
-// single-key (arity [2,2]); PR B widens them for expiry options and variadic keys
-// and adds the handshake commands.
-var commandTable = map[string]command{
-	"PING": {name: "PING", minArgs: 1, maxArgs: 2, handler: cmdPing},
-	"QUIT": {name: "QUIT", minArgs: 1, maxArgs: 1, handler: cmdQuit},
-	"GET":  {name: "GET", minArgs: 2, maxArgs: 2, handler: cmdGet},
-	"SET":  {name: "SET", minArgs: 3, maxArgs: 3, handler: cmdSet},
-	"DEL":  {name: "DEL", minArgs: 2, maxArgs: 2, handler: cmdDel},
+// commandTable maps an upper-cased command name to its command. It is populated in
+// init (not as a composite-literal initializer) so a handler may legally reference
+// the table itself — COMMAND COUNT reports len(commandTable), which would otherwise
+// form an initialization cycle. A new command is one row plus one handler.
+var commandTable map[string]command
+
+func init() {
+	commandTable = map[string]command{
+		"PING":    {name: "PING", minArgs: 1, maxArgs: 2, handler: cmdPing},
+		"QUIT":    {name: "QUIT", minArgs: 1, maxArgs: 1, handler: cmdQuit},
+		"GET":     {name: "GET", minArgs: 2, maxArgs: 2, handler: cmdGet},
+		"SET":     {name: "SET", minArgs: 3, maxArgs: 5, handler: cmdSet},
+		"DEL":     {name: "DEL", minArgs: 2, maxArgs: -1, handler: cmdDel},
+		"EXISTS":  {name: "EXISTS", minArgs: 2, maxArgs: -1, handler: cmdExists},
+		"TTL":     {name: "TTL", minArgs: 2, maxArgs: 2, handler: cmdTTL},
+		"PTTL":    {name: "PTTL", minArgs: 2, maxArgs: 2, handler: cmdPTTL},
+		"HELLO":   {name: "HELLO", minArgs: 1, maxArgs: -1, handler: cmdHello},
+		"COMMAND": {name: "COMMAND", minArgs: 1, maxArgs: -1, handler: cmdCommand},
+		"CONFIG":  {name: "CONFIG", minArgs: 2, maxArgs: -1, handler: cmdConfig},
+		"SELECT":  {name: "SELECT", minArgs: 2, maxArgs: 2, handler: cmdSelect},
+	}
 }
 
 // dispatch validates the command name and arity centrally, then runs the handler.

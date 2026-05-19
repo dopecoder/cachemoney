@@ -161,3 +161,30 @@ func TestServeConnStopsWhenShuttingDown(t *testing.T) {
 	}()
 	waitDone(t, done) // the fast-path returns before any read
 }
+
+// --- Increment 5: idle timeout + rejectConn polite close (Req 9) --------------
+
+func TestIdleTimeoutClosesIdleConnection(t *testing.T) {
+	srv := New(cache.New(), Config{IdleTimeout: 20 * time.Millisecond})
+	_, done := runConn(t, srv)
+	// The client sends nothing; the per-read idle deadline fires and the loop
+	// classifies the deadline error as a silent close.
+	waitDone(t, done)
+}
+
+func TestRejectConnWritesPoliteErrorThenCloses(t *testing.T) {
+	srv := New(cache.New(), Config{})
+	serverSide, clientSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	_ = clientSide.SetDeadline(time.Now().Add(2 * time.Second))
+
+	done := make(chan struct{})
+	go func() {
+		srv.rejectConn(serverSide)
+		close(done)
+	}()
+
+	wantReply(t, clientSide, "-ERR max number of clients reached\r\n")
+	expectClosed(t, clientSide)
+	waitDone(t, done)
+}

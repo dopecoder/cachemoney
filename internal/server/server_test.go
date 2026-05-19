@@ -448,3 +448,65 @@ func TestShutdownBeforeServeReturnsClosed(t *testing.T) {
 		t.Fatal("Serve did not return after Shutdown-before-Serve (listener left open)")
 	}
 }
+
+// --- Requirement 9: resource guards (I5 integration) --------------------------
+
+func TestIdleTimeoutRealSocketClosesPromptly(t *testing.T) {
+	_, addr := startServer(t, cache.New(), Config{IdleTimeout: 40 * time.Millisecond})
+	c := dial(t, addr)
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	buf := make([]byte, 1)
+	start := time.Now()
+	_, err := c.Read(buf)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected the server to close the idle connection")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("idle close took %v; want it driven by the ~40ms server timeout", elapsed)
+	}
+}
+
+func TestMaxConnsRejectsBeyondCapAndFreesOnClose(t *testing.T) {
+	_, addr := startServer(t, cache.New(), Config{MaxConns: 1})
+
+	c1 := dial(t, addr)
+	mustWrite(t, c1, encodeCmd("PING"))
+	wantReply(t, c1, "+PONG\r\n") // c1 holds the only slot
+
+	c2, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("dial c2: %v", err)
+	}
+	defer func() { _ = c2.Close() }()
+	_ = c2.SetDeadline(time.Now().Add(2 * time.Second))
+	wantReply(t, c2, "-ERR max number of clients reached\r\n")
+	expectClosed(t, c2)
+
+	// The existing connection keeps serving while the cap is full.
+	mustWrite(t, c1, encodeCmd("PING"))
+	wantReply(t, c1, "+PONG\r\n")
+
+	// Closing c1 frees its slot; a fresh connection is then served.
+	_ = c1.Close()
+	served := false
+	for i := 0; i < 100; i++ {
+		c3, derr := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if derr != nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		_ = c3.SetDeadline(time.Now().Add(time.Second))
+		if _, werr := c3.Write(encodeCmd("PING")); werr == nil && expect(c3, "+PONG\r\n") == nil {
+			served = true
+			_ = c3.Close()
+			break
+		}
+		_ = c3.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !served {
+		t.Fatal("a slot did not free after the holding connection closed")
+	}
+}

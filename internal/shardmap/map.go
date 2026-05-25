@@ -148,6 +148,23 @@ func (m *Map[K, V]) Set(key K, value V) {
 	s.mu.Unlock()
 }
 
+// Swap stores value under key and returns the previous value and whether one was
+// present, performing the lookup and the insert under a SINGLE write-lock
+// acquisition. Holding the lock across both lets a caller compute an exact
+// overwrite delta (new vs old) without a separate, racy read: two goroutines
+// swapping the same key serialize on the lock, and each observes the value it
+// actually replaced. Like Set it holds the write lock across the (possibly
+// reallocating) insert.
+func (m *Map[K, V]) Swap(key K, value V) (old V, existed bool) {
+	h := m.hasher(m.seed, key)
+	s := &m.shards[shardIndex(h, m.shardShift)]
+	s.mu.Lock()
+	old, existed = s.t.lookup(h, key)
+	s.t.insert(h, key, value)
+	s.mu.Unlock()
+	return old, existed
+}
+
 // Delete removes the entry under key, returning the removed value and whether it
 // was present. The shard write lock is held across the ENTIRE table.delete call
 // because backward-shift deletion may shrink and reallocate every slot array; a

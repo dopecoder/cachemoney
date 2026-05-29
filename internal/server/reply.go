@@ -56,3 +56,12 @@ func (c *conn) replyWrongArity(name string) {
 func (c *conn) replyEngineErr(err error) error {
 	return c.w.WriteError("ERR " + sanitizeText([]byte(err.Error())))
 }
+
+// writeOOM emits the exact Redis out-of-memory reply for a write rejected under
+// maxmemory-policy=noeviction at capacity. resp.Writer.WriteError prepends '-' and
+// appends CRLF, so the framed reply is
+// "-OOM command not allowed when used memory > 'maxmemory'\r\n". The connection
+// stays open.
+func (c *conn) writeOOM() error {
+	return c.w.WriteError("OOM command not allowed when used memory > 'maxmemory'")
+}

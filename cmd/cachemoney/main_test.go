@@ -2,14 +2,27 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/dopecoder/cachemoney/internal/cache"
 	"github.com/dopecoder/cachemoney/internal/server"
 )
+
+// respCmd encodes a RESP array command for the raw-socket integration tests.
+func respCmd(parts ...string) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(parts))
+	for _, p := range parts {
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(p), p)
+	}
+	return []byte(b.String())
+}
 
 // emptyEnv is a lookupEnv that reports every key as unset.
 func emptyEnv(string) (string, bool) { return "", false }
@@ -25,7 +38,7 @@ func mapEnv(m map[string]string) func(string) (string, bool) {
 // --- parseConfig (pure unit, Req 11) ------------------------------------------
 
 func TestParseConfigDefaults(t *testing.T) {
-	cfg, showVersion, err := parseConfig(nil, emptyEnv)
+	cfg, _, showVersion, err := parseConfig(nil, emptyEnv)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -53,7 +66,7 @@ func TestParseConfigFlagsOverride(t *testing.T) {
 		"-max-conns=5",
 		"-drain-timeout=2s",
 	}
-	cfg, _, err := parseConfig(args, emptyEnv)
+	cfg, _, _, err := parseConfig(args, emptyEnv)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -64,7 +77,7 @@ func TestParseConfigFlagsOverride(t *testing.T) {
 }
 
 func TestParseConfigVersionFlag(t *testing.T) {
-	_, showVersion, err := parseConfig([]string{"-version"}, emptyEnv)
+	_, _, showVersion, err := parseConfig([]string{"-version"}, emptyEnv)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -80,7 +93,7 @@ func TestParseConfigEnvFallback(t *testing.T) {
 		"CACHEMONEY_MAX_CONNS":     "42",
 		"CACHEMONEY_DRAIN_TIMEOUT": "7s",
 	})
-	cfg, _, err := parseConfig(nil, env)
+	cfg, _, _, err := parseConfig(nil, env)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -96,7 +109,7 @@ func TestParseConfigInvalidEnvFallsBackToDefault(t *testing.T) {
 		"CACHEMONEY_IDLE_TIMEOUT":  "notaduration",
 		"CACHEMONEY_DRAIN_TIMEOUT": "alsobad",
 	})
-	cfg, _, err := parseConfig(nil, env)
+	cfg, _, _, err := parseConfig(nil, env)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -107,7 +120,7 @@ func TestParseConfigInvalidEnvFallsBackToDefault(t *testing.T) {
 
 func TestParseConfigFlagBeatsEnv(t *testing.T) {
 	env := mapEnv(map[string]string{"CACHEMONEY_ADDR": "1.2.3.4:9999"})
-	cfg, _, err := parseConfig([]string{"-addr=:7000"}, env)
+	cfg, _, _, err := parseConfig([]string{"-addr=:7000"}, env)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -117,7 +130,7 @@ func TestParseConfigFlagBeatsEnv(t *testing.T) {
 }
 
 func TestParseConfigParseError(t *testing.T) {
-	if _, _, err := parseConfig([]string{"-nonexistent-flag"}, emptyEnv); err == nil {
+	if _, _, _, err := parseConfig([]string{"-nonexistent-flag"}, emptyEnv); err == nil {
 		t.Fatal("parseConfig with an unknown flag: want error, got nil")
 	}
 }
@@ -212,4 +225,170 @@ func TestRunReturnsNilWhenServerClosedExternally(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("run did not return after an external shutdown")
 	}
+}
+
+// --- eviction flags + Close ordering (PR C / I5) ------------------------------
+
+func TestParseConfigEvictionFlags(t *testing.T) {
+	cfg, opts, _, err := parseConfig(
+		[]string{"-maxmemory=1048576", "-maxmemory-policy=allkeys-random"}, emptyEnv,
+	)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	_ = cfg
+	c := cache.New(opts...)
+	defer func() { _ = c.Close() }()
+	if c.MaxMemory() != 1048576 {
+		t.Errorf("seeded MaxMemory() = %d, want 1048576", c.MaxMemory())
+	}
+	if c.EvictionPolicy() != cache.PolicyAllKeysRandom {
+		t.Errorf("seeded EvictionPolicy() = %v, want allkeys-random", c.EvictionPolicy())
+	}
+}
+
+func TestParseConfigDefaultEvictionFlags(t *testing.T) {
+	_, opts, _, err := parseConfig(nil, emptyEnv)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	c := cache.New(opts...)
+	defer func() { _ = c.Close() }()
+	if c.MaxMemory() != 0 {
+		t.Errorf("default MaxMemory() = %d, want 0 (unbounded)", c.MaxMemory())
+	}
+	if c.EvictionPolicy() != cache.PolicyAllKeysLFU {
+		t.Errorf("default EvictionPolicy() = %v, want allkeys-lfu", c.EvictionPolicy())
+	}
+}
+
+func TestParseConfigInvalidPolicyErrors(t *testing.T) {
+	if _, _, _, err := parseConfig([]string{"-maxmemory-policy=volatile-lru"}, emptyEnv); err == nil {
+		t.Fatal("parseConfig with an unsupported -maxmemory-policy: want error, got nil")
+	}
+}
+
+func TestParseConfigPolicyFlagIsCaseInsensitive(t *testing.T) {
+	_, opts, _, err := parseConfig([]string{"-maxmemory-policy=AllKeys-Random"}, emptyEnv)
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	c := cache.New(opts...)
+	defer func() { _ = c.Close() }()
+	if c.EvictionPolicy() != cache.PolicyAllKeysRandom {
+		t.Errorf("mixed-case policy flag = %v, want allkeys-random", c.EvictionPolicy())
+	}
+}
+
+func TestParseConfigInvalidPolicyEnvFallsBack(t *testing.T) {
+	// A malformed env policy falls back to the default (allkeys-lfu) rather than
+	// failing startup, matching the other env helpers.
+	_, opts, _, err := parseConfig(nil, mapEnv(map[string]string{"CACHEMONEY_MAXMEMORY_POLICY": "garbage"}))
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	c := cache.New(opts...)
+	defer func() { _ = c.Close() }()
+	if c.EvictionPolicy() != cache.PolicyAllKeysLFU {
+		t.Errorf("malformed env policy did not fall back: %v, want allkeys-lfu", c.EvictionPolicy())
+	}
+}
+
+func TestParseConfigPolicyEnv(t *testing.T) {
+	_, opts, _, err := parseConfig(nil, mapEnv(map[string]string{"CACHEMONEY_MAXMEMORY_POLICY": "noeviction"}))
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	c := cache.New(opts...)
+	defer func() { _ = c.Close() }()
+	if c.EvictionPolicy() != cache.PolicyNoEviction {
+		t.Errorf("env policy = %v, want noeviction", c.EvictionPolicy())
+	}
+}
+
+func TestParseConfigMaxMemoryEnv(t *testing.T) {
+	_, opts, _, err := parseConfig(nil, mapEnv(map[string]string{"CACHEMONEY_MAXMEMORY": "2048"}))
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	c := cache.New(opts...)
+	defer func() { _ = c.Close() }()
+	if c.MaxMemory() != 2048 {
+		t.Errorf("MaxMemory() from env = %d, want 2048", c.MaxMemory())
+	}
+}
+
+func TestParseConfigInvalidMaxMemoryEnvFallsBack(t *testing.T) {
+	_, opts, _, err := parseConfig(nil, mapEnv(map[string]string{"CACHEMONEY_MAXMEMORY": "notanumber"}))
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	c := cache.New(opts...)
+	defer func() { _ = c.Close() }()
+	if c.MaxMemory() != 0 {
+		t.Errorf("invalid CACHEMONEY_MAXMEMORY did not fall back: MaxMemory() = %d, want 0", c.MaxMemory())
+	}
+}
+
+// TestRunThenCloseUnderEvictionNoPanic replicates main's lifecycle ordering
+// (server.Shutdown via run, THEN engine.Close) under live eviction + drainer traffic
+// and asserts no panic and clean returns (spec Req 11 s2).
+func TestRunThenCloseUnderEvictionNoPanic(t *testing.T) {
+	addr := freeAddr(t)
+	engine := cache.New(
+		cache.WithMaxMemory(8192), cache.WithEvictionPolicy(cache.PolicyAllKeysLFU), cache.WithShards(4),
+	)
+	srv := server.New(engine, server.Config{Addr: addr})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- run(ctx, srv, time.Second) }()
+
+	conn := waitDial(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// SET (drives eviction past the 8 KB ceiling) + an immediate GET (drives the
+	// frequency drainer via Record); the just-written key is always readable (C-INV-1).
+	for i := 0; i < 400; i++ {
+		k := "k" + strconv.Itoa(i)
+		if _, err := conn.Write(respCmd("SET", k, "v")); err != nil {
+			t.Fatalf("write SET: %v", err)
+		}
+		if err := readExact(conn, "+OK\r\n"); err != nil {
+			t.Fatalf("SET reply: %v", err)
+		}
+		if _, err := conn.Write(respCmd("GET", k)); err != nil {
+			t.Fatalf("write GET: %v", err)
+		}
+		if err := readExact(conn, "$1\r\nv\r\n"); err != nil {
+			t.Fatalf("GET reply: %v", err)
+		}
+	}
+	_ = conn.Close()
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run = %v, want nil after a clean drain", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run did not return after context cancel")
+	}
+
+	// Close the engine AFTER the server has drained — must not panic and returns nil.
+	if err := engine.Close(); err != nil {
+		t.Fatalf("engine.Close after shutdown = %v", err)
+	}
+}
+
+// readExact reads len(want) bytes from r and checks they equal want.
+func readExact(r io.Reader, want string) error {
+	buf := make([]byte, len(want))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return err
+	}
+	if string(buf) != want {
+		return fmt.Errorf("reply = %q, want %q", buf, want)
+	}
+	return nil
 }

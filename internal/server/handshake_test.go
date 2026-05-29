@@ -138,12 +138,18 @@ func TestCommandStub(t *testing.T) {
 func TestConfigStub(t *testing.T) {
 	client, _ := runConn(t, New(cache.New(), Config{}))
 
+	// CONFIG GET maxmemory is now live: a default engine reports 0 (unbounded) as a
+	// two-element key/value array.
 	mustWrite(t, client, encodeCmd("CONFIG", "GET", "maxmemory"))
-	wantReply(t, client, "*0\r\n")
+	wantReply(t, client, "*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n")
 
-	mustWrite(t, client, encodeCmd("CONFIG", "SET", "maxmemory", "100mb"))
+	// CONFIG SET maxmemory takes a decimal byte count and replies +OK.
+	mustWrite(t, client, encodeCmd("CONFIG", "SET", "maxmemory", "1048576"))
 	wantReply(t, client, "+OK\r\n")
+	mustWrite(t, client, encodeCmd("CONFIG", "GET", "maxmemory"))
+	wantReply(t, client, "*2\r\n$9\r\nmaxmemory\r\n$7\r\n1048576\r\n")
 
+	// An unknown sub-command stays a non-fatal -ERR.
 	mustWrite(t, client, encodeCmd("CONFIG", "BOGUS"))
 	line := readLine(t, client)
 	if !strings.HasPrefix(line, "-ERR ") {

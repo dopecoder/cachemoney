@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,7 +30,7 @@ import (
 var version = "dev"
 
 func main() {
-	cfg, showVersion, err := parseConfig(os.Args[1:], os.LookupEnv)
+	cfg, cacheOpts, showVersion, err := parseConfig(os.Args[1:], os.LookupEnv)
 	switch {
 	case err != nil:
 		fmt.Fprintln(os.Stderr, err)
@@ -40,12 +41,19 @@ func main() {
 	}
 
 	cfg.Version = version // report the build version in the HELLO handshake
-	srv := server.New(cache.New(), cfg)
+	engine := cache.New(cacheOpts...)
+	srv := server.New(engine, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	log.Printf("cachemoney %s listening on %s", version, cfg.Addr)
 	err = run(ctx, srv, cfg.DrainTimeout)
 	stop() // release the signal handler before any fatal exit
+
+	// Stop the engine's eviction drainer AFTER the server has drained connections, so
+	// no Get/Set runs concurrently with Close (eviction design §5.5). Close is
+	// idempotent and leak-free; it runs on the bind-error path too (the drainer started
+	// at cache.New).
+	_ = engine.Close()
 
 	if err != nil {
 		log.Fatalf("cachemoney: %v", err)
@@ -53,10 +61,11 @@ func main() {
 }
 
 // parseConfig maps command-line arguments and the environment into a
-// server.Config plus the -version flag. It does no I/O — the environment is read
-// through the injected lookupEnv — so it is a pure unit. Precedence is
-// flag > environment > built-in default for each knob.
-func parseConfig(args []string, lookupEnv func(string) (string, bool)) (server.Config, bool, error) {
+// server.Config, the cache construction options (maxmemory / maxmemory-policy), and
+// the -version flag. It does no I/O — the environment is read through the injected
+// lookupEnv — so it is a pure unit. Precedence is flag > environment > built-in
+// default for each knob. An invalid -maxmemory-policy is a hard startup error.
+func parseConfig(args []string, lookupEnv func(string) (string, bool)) (server.Config, []cache.Option, bool, error) {
 	fs := flag.NewFlagSet("cachemoney", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
@@ -68,10 +77,14 @@ func parseConfig(args []string, lookupEnv func(string) (string, bool)) (server.C
 		"maximum concurrent connections")
 	drain := fs.Duration("drain-timeout", envDuration(lookupEnv, "CACHEMONEY_DRAIN_TIMEOUT", 5*time.Second),
 		"graceful-shutdown drain timeout")
+	maxMemory := fs.Int64("maxmemory", envInt64(lookupEnv, "CACHEMONEY_MAXMEMORY", 0),
+		"max memory in bytes the engine holds by eviction (0 = unbounded)")
+	maxMemoryPolicy := fs.String("maxmemory-policy", envPolicy(lookupEnv, "CACHEMONEY_MAXMEMORY_POLICY", "allkeys-lfu"),
+		"eviction policy: noeviction | allkeys-lfu | allkeys-random")
 	showVersion := fs.Bool("version", false, "print version and exit")
 
 	if err := fs.Parse(args); err != nil {
-		return server.Config{}, false, err
+		return server.Config{}, nil, false, err
 	}
 	cfg := server.Config{
 		Addr:         *addr,
@@ -79,7 +92,15 @@ func parseConfig(args []string, lookupEnv func(string) (string, bool)) (server.C
 		MaxConns:     *maxConns,
 		DrainTimeout: *drain,
 	}
-	return cfg, *showVersion, nil
+	// Policy names are matched case-insensitively (matching CONFIG SET). An explicitly
+	// passed but unsupported flag is a hard startup error; a malformed env value already
+	// fell back to the default via envPolicy.
+	policy, ok := cache.ParsePolicy(strings.ToLower(*maxMemoryPolicy))
+	if !ok {
+		return server.Config{}, nil, false, fmt.Errorf("invalid -maxmemory-policy %q (want noeviction|allkeys-lfu|allkeys-random)", *maxMemoryPolicy)
+	}
+	cacheOpts := []cache.Option{cache.WithMaxMemory(*maxMemory), cache.WithEvictionPolicy(policy)}
+	return cfg, cacheOpts, *showVersion, nil
 }
 
 // envString returns the environment value for key, or def when unset.
@@ -96,6 +117,30 @@ func envInt(lookupEnv func(string) (string, bool), key string, def int) int {
 	if v, ok := lookupEnv(key); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// envInt64 returns the int64 environment value for key, or def when unset or
+// unparseable.
+func envInt64(lookupEnv func(string) (string, bool), key string, def int64) int64 {
+	if v, ok := lookupEnv(key); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// envPolicy returns the canonical policy name from key's env value when it names a
+// supported policy (case-insensitive), or def otherwise. A malformed env override
+// falls back rather than failing startup — matching envInt/envDuration — while an
+// explicitly passed -maxmemory-policy flag is still hard-validated in parseConfig.
+func envPolicy(lookupEnv func(string) (string, bool), key, def string) string {
+	if v, ok := lookupEnv(key); ok {
+		if p, valid := cache.ParsePolicy(strings.ToLower(v)); valid {
+			return p.String()
 		}
 	}
 	return def

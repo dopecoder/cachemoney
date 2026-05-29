@@ -2,9 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"time"
+
+	"github.com/dopecoder/cachemoney/internal/cache"
 )
 
 // engineCtx is the context handlers pass to the engine. It is deliberately not
@@ -42,13 +45,17 @@ func cmdGet(c *conn, args [][]byte) error {
 
 // cmdSet stores value under key. Plain SET (no option) persists (ttl 0); an EX/PX/
 // EXAT/PXAT option sets a relative TTL. A parse/guard failure replies -ERR, stores
-// nothing, and keeps the connection open.
+// nothing, and keeps the connection open. Under maxmemory-policy=noeviction at
+// capacity the engine returns cache.ErrOOM, which maps to the Redis -OOM reply.
 func cmdSet(c *conn, args [][]byte) error {
 	ttl, errMsg := c.parseSetExpiry(args[3:])
 	if errMsg != "" {
 		return c.w.WriteError(errMsg)
 	}
 	if err := c.srv.engine.Set(engineCtx(), string(args[1]), args[2], ttl); err != nil {
+		if errors.Is(err, cache.ErrOOM) {
+			return c.writeOOM()
+		}
 		return c.replyEngineErr(err)
 	}
 	return c.w.WriteSimpleString("OK")

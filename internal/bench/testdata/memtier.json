@@ -1,0 +1,14 @@
+{
+  "ALL STATS": {
+    "Totals": {
+      "Ops/sec": 95234.5,
+      "Hits/sec": 81000.0,
+      "Misses/sec": 9000.0,
+      "Percentile Latencies": {
+        "p50.00": 0.420,
+        "p99.00": 1.310,
+        "p99.90": 3.780
+      }
+    }
+  }
+}

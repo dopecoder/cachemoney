@@ -86,6 +86,13 @@ bench:
 fuzz:
 	$(GO) test -run='^$$' -fuzz=FuzzMapModelEquivalence -fuzztime=$(FUZZTIME) ./internal/shardmap
 
+## bench-compare: Four-way RESP benchmark (cachemoney vs Redis/Valkey/pogocache); skips absent servers.
+.PHONY: bench-compare
+bench-compare: build
+	$(GO) build -o $(BIN_DIR)/cmbench ./cmd/cmbench
+	set -a; . ./bench/versions.env; set +a; \
+		BENCH_DOC=docs/benchmarks/bench-vs-redis.md $(BIN_DIR)/cmbench
+
 ## build: Build the cachemoney binary.
 .PHONY: build
 build:

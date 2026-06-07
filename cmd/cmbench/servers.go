@@ -69,24 +69,24 @@ var servers = []serverSpec{
 		name: "valkey", port: 6392, localBin: "valkey-server", image: env("VALKEY_IMAGE", "valkey/valkey:8.1"),
 		startCmd: func(m mode, s serverSpec) []string {
 			args := redisServerArgs(s.port)
-			args[0] = "valkey-server"
-			if m == modeLocal {
-				return startRESP(m, s, args)
-			}
-			// The valkey image's entrypoint is valkey-server; pass flags only.
+			args[0] = "valkey-server" // the valkey image's CMD is valkey-server
 			return startRESP(m, s, args)
 		},
 	},
 	{
-		name: "pogocache", port: 6393, localBin: "pogocache", image: env("POGOCACHE_IMAGE", "tidwall/pogocache:latest"),
-		// pogocache: closest evict-any policy at the same maxmemory (no LFU — documented
-		// as a non-exact equivalence in the results caveats).
+		name: "pogocache", port: 6393, localBin: "pogocache", image: env("POGOCACHE_IMAGE", "pogocache/pogocache:1.3.1"),
+		// pogocache uses -p/--maxmemory/--evict (no LFU — its sampled eviction is the
+		// closest equivalence, documented in the results caveats). Its Docker image
+		// entrypoint IS pogocache, so the container takes the flags directly (no command).
 		startCmd: func(m mode, s serverSpec) []string {
-			args := []string{
-				"pogocache", "--port", fmt.Sprintf("%d", s.port),
-				"--maxmemory", fmt.Sprintf("%d", maxmemoryBytes),
+			flags := []string{
+				"-p", fmt.Sprintf("%d", s.port),
+				"--maxmemory", fmt.Sprintf("%d", maxmemoryBytes), "--evict", "yes",
 			}
-			return startRESP(m, s, args)
+			if m == modeLocal {
+				return append([]string{s.localBin}, flags...)
+			}
+			return append([]string{"docker", "run", "--rm", "-d", "--network", "host", s.image}, flags...)
 		},
 	},
 }

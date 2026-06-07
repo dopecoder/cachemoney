@@ -180,14 +180,20 @@ func TestRealLookupAndToolsConstruct(t *testing.T) {
 		t.Error("realLookup should find the go binary on PATH")
 	}
 	_ = lk.hasDocker()
-	_ = lk.hasImage("cachemoney/definitely-not-an-image:0") // exercises the inspect path
+	// NB: lk.hasImage is deliberately NOT called here — it pulls a missing image, a
+	// network side effect that does not belong in `make test`. It is exercised by the
+	// opt-in end-to-end smoke and by `make bench-compare`.
 	tools := realTools(lk)
 	_ = tools.redisImage
 }
 
-// TestDriverEndToEndSmoke runs a real measurement only when the tooling is present;
-// otherwise it skips (the authoring host has neither the images nor the native tools).
+// TestDriverEndToEndSmoke runs a real measurement against live servers. It is opt-in
+// (BENCH_SMOKE=1) so `make test` / CI never pulls images or runs a multi-minute
+// benchmark; the real entrypoint is `make bench-compare`.
 func TestDriverEndToEndSmoke(t *testing.T) {
+	if os.Getenv("BENCH_SMOKE") == "" {
+		t.Skip("set BENCH_SMOKE=1 to run the end-to-end benchmark smoke (needs Docker + images or native tools)")
+	}
 	lk := realLookup()
 	tools := realTools(lk)
 	if tools.redisBench == modeSkip && tools.memtier == modeSkip {

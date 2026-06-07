@@ -25,7 +25,7 @@ type toolset struct {
 // realTools probes the environment for redis-benchmark + memtier_benchmark.
 func realTools(lk lookup) toolset {
 	redisImage := env("REDIS_IMAGE", "redis:7.4")
-	memtierImage := env("MEMTIER_IMAGE", "redislabs/memtier_benchmark:2.1.1")
+	memtierImage := env("MEMTIER_IMAGE", "redislabs/memtier_benchmark:2.4.2")
 	return toolset{
 		redisBench:   lk.toolMode("redis-benchmark", redisImage),
 		memtier:      lk.toolMode("memtier_benchmark", memtierImage),

@@ -38,7 +38,16 @@ func realLookup() lookup {
 		},
 		hasDocker: func() bool { _, err := exec.LookPath("docker"); return err == nil },
 		hasImage: func(image string) bool {
-			return exec.Command("docker", "image", "inspect", image).Run() == nil
+			if exec.Command("docker", "image", "inspect", image).Run() == nil {
+				return true // already pulled locally
+			}
+			// Not present: pull the pinned image (first run may be slow). Progress is
+			// streamed so the operator sees what is happening; a pull failure (bad image
+			// / no network) leaves the image unavailable and the server is skipped.
+			fmt.Fprintf(os.Stderr, "pulling %s (first run may take a while)...\n", image)
+			pull := exec.Command("docker", "pull", image)
+			pull.Stdout, pull.Stderr = os.Stderr, os.Stderr
+			return pull.Run() == nil
 		},
 	}
 }

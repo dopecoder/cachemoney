@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,119 +11,74 @@ import (
 	"github.com/dopecoder/cachemoney/internal/bench"
 )
 
-// toolset records how the bench tools can be run (local binary or via a pinned image).
-// redis-benchmark ships inside the Redis image, so it reuses REDIS_IMAGE.
-type toolset struct {
-	redisBench   mode
-	memtier      mode
-	redisImage   string
-	memtierImage string
-}
-
-// realTools probes the environment for redis-benchmark + memtier_benchmark.
-func realTools(lk lookup) toolset {
-	redisImage := env("REDIS_IMAGE", "redis:7.4")
-	memtierImage := env("MEMTIER_IMAGE", "redislabs/memtier_benchmark:2.4.2")
-	return toolset{
-		redisBench:   lk.toolMode("redis-benchmark", redisImage),
-		memtier:      lk.toolMode("memtier_benchmark", memtierImage),
-		redisImage:   redisImage,
-		memtierImage: memtierImage,
-	}
-}
-
-// execMeasurer returns a measurer that starts a server, runs whichever tools are available
-// R times (median reported), and parses the output. It is the os/exec seam — exercised only
-// when the tooling is present (smoke-covered); the skip-when-absent path never reaches it.
-func execMeasurer(tools toolset) measurer {
+// execMeasurer is the os/exec seam: it starts a server on the bridge, probes readiness,
+// runs redis-benchmark (throughput + p50/p99) and memtier (hit ratio + p99.9), each with
+// a discarded warmup followed by `repeats` measured runs whose median is reported. It is
+// exercised by the opt-in end-to-end smoke and by `make bench-compare`.
+func execMeasurer(net string) measurer {
 	return func(p planned) (bench.Result, error) {
-		if tools.redisBench == modeSkip && tools.memtier == modeSkip {
-			return bench.Result{}, fmt.Errorf("no redis-benchmark or memtier_benchmark available")
-		}
-		stop, err := startServer(p)
+		stop, err := startServer(p.spec, net)
 		if err != nil {
 			return bench.Result{}, err
 		}
 		defer stop()
 
-		addr := fmt.Sprintf("localhost:%d", p.spec.port)
-		if err := waitReady(addr, 10*time.Second); err != nil {
+		cname := containerName(p.spec.name)
+		if err := waitReady(net, cname, 20*time.Second); err != nil {
 			return bench.Result{}, err
 		}
-
-		res := bench.Result{Server: p.spec.name}
-		if tools.redisBench != modeSkip {
-			tr, err := medianRedisBench(tools, p.spec.port)
-			if err != nil {
-				return bench.Result{}, err
-			}
-			res.Throughput = tr
-		}
-		if tools.memtier != modeSkip {
-			hit, err := medianMemtier(tools, p.spec.port)
-			if err != nil {
-				return bench.Result{}, err
-			}
-			res.Hit = &hit
-		}
-		return res, nil
-	}
-}
-
-// startServer launches the server (local process or detached container) and returns a
-// teardown. For a container the teardown stops it; for a local process it kills it.
-func startServer(p planned) (stop func(), err error) {
-	argv := p.spec.startCmd(p.mode, p.spec)
-	if p.mode == modeDocker {
-		out, err := exec.Command(argv[0], argv[1:]...).Output() //nolint:gosec // argv from fixed internal serverSpec, not external input
+		tr, err := medianRedisBench(net, cname)
 		if err != nil {
-			return nil, fmt.Errorf("docker run %s: %w", p.spec.name, err)
+			return bench.Result{}, err
 		}
-		id := strings.TrimSpace(string(out))
-		return func() { _ = exec.Command("docker", "stop", id).Run() }, nil //nolint:gosec // id is the container this process just started
+		hit, err := medianMemtier(net, cname)
+		if err != nil {
+			return bench.Result{}, err
+		}
+		return bench.Result{Server: p.spec.name, Throughput: tr, Hit: &hit}, nil
 	}
-	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // argv from fixed internal serverSpec, not external input
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start %s: %w", p.spec.name, err)
-	}
-	return func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }, nil
 }
 
-// waitReady dials addr and PINGs over RESP until it gets +PONG or the timeout elapses.
-func waitReady(addr string, timeout time.Duration) error {
+// startServer launches the server container and returns a stop func that removes it. A
+// server declaring a localFile (e.g. cachemoney's mounted static binary) fails fast with a
+// clear message when that file is absent, rather than starting a container that exits
+// immediately and burning the readiness timeout.
+func startServer(s serverSpec, net string) (func(), error) {
+	if s.localFile != "" {
+		if _, err := os.Stat(s.localFile); err != nil {
+			return nil, fmt.Errorf("%s: required file %s not found (build it, e.g. via `make bench-compare`): %w", s.name, s.localFile, err)
+		}
+	}
+	argv := s.runArgs(net)
+	if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil { //nolint:gosec // argv from fixed internal serverSpec, not external input
+		return nil, fmt.Errorf("start %s: %w", s.name, err)
+	}
+	cname := containerName(s.name)
+	return func() { _ = exec.Command("docker", "stop", cname).Run() }, nil //nolint:gosec // cname is a fixed internal container name, not external input
+}
+
+// waitReady probes the server by name from a throwaway redis-cli container on the bridge
+// until it answers PONG or the timeout elapses.
+func waitReady(net, cname string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if pingOK(addr) {
+		out, _ := exec.Command("docker", "run", "--rm", "--network", net, redisImage, //nolint:gosec // fixed argv from internal config
+			"redis-cli", "-h", cname, "-p", fmt.Sprintf("%d", serverPort), "ping").Output()
+		if strings.Contains(string(out), "PONG") {
 			return nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("server at %s not ready within %s", addr, timeout)
+	return fmt.Errorf("server %s not ready within %s", cname, timeout)
 }
 
-func pingOK(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
-	if _, err := conn.Write([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
-		return false
-	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	return err == nil && strings.HasPrefix(line, "+PONG")
-}
-
-// medianRedisBench discards a warmup pass, then runs R measured repeats and returns the
-// per-command median of rps/p50/p99 (spec Req 4: discard a warmup, median the repeats).
-func medianRedisBench(tools toolset, port int) ([]bench.ThroughputResult, error) {
-	if _, err := runRedisBenchOnce(tools, port); err != nil { // warmup pass, discarded
+func medianRedisBench(net, cname string) ([]bench.ThroughputResult, error) {
+	if _, err := runRedisBenchOnce(net, cname); err != nil { // warmup, discarded
 		return nil, err
 	}
 	runs := make([][]bench.ThroughputResult, 0, repeats)
-	for i := 0; i < repeats; i++ {
-		trs, err := runRedisBenchOnce(tools, port)
+	for range repeats {
+		trs, err := runRedisBenchOnce(net, cname)
 		if err != nil {
 			return nil, err
 		}
@@ -134,24 +87,24 @@ func medianRedisBench(tools toolset, port int) ([]bench.ThroughputResult, error)
 	return bench.MedianThroughput(runs), nil
 }
 
-func runRedisBenchOnce(tools toolset, port int) ([]bench.ThroughputResult, error) {
-	argv := redisBenchArgv(tools, port)
-	out, err := exec.Command(argv[0], argv[1:]...).Output() //nolint:gosec // argv from fixed internal tool config, not external input
+func runRedisBenchOnce(net, cname string) ([]bench.ThroughputResult, error) {
+	out, err := exec.Command("docker", "run", "--rm", "--network", net, redisImage, //nolint:gosec // fixed argv from internal config
+		"redis-benchmark", "-h", cname, "-p", fmt.Sprintf("%d", serverPort),
+		"-t", "get,set", "-n", fmt.Sprintf("%d", redisRequests),
+		"-c", fmt.Sprintf("%d", redisClients), "-d", fmt.Sprintf("%d", valueSize), "--csv").Output()
 	if err != nil {
 		return nil, fmt.Errorf("redis-benchmark: %w", err)
 	}
 	return bench.ParseRedisBench(out)
 }
 
-// medianMemtier discards a warmup pass (which primes the cache), then runs R measured
-// repeats and returns the repeat whose hit ratio is the median.
-func medianMemtier(tools toolset, port int) (bench.HitRatioResult, error) {
-	if _, err := runMemtierParsed(tools, port); err != nil { // warmup pass, discarded
+func medianMemtier(net, cname string) (bench.HitRatioResult, error) {
+	if _, err := runMemtierOnce(net, cname); err != nil { // warmup, discarded
 		return bench.HitRatioResult{}, err
 	}
 	runs := make([]bench.HitRatioResult, 0, repeats)
-	for i := 0; i < repeats; i++ {
-		hit, err := runMemtierParsed(tools, port)
+	for range repeats {
+		hit, err := runMemtierOnce(net, cname)
 		if err != nil {
 			return bench.HitRatioResult{}, err
 		}
@@ -160,58 +113,29 @@ func medianMemtier(tools toolset, port int) (bench.HitRatioResult, error) {
 	return bench.MedianHitRatio(runs), nil
 }
 
-func runMemtierParsed(tools toolset, port int) (bench.HitRatioResult, error) {
-	out, err := runMemtier(tools, port)
+func runMemtierOnce(net, cname string) (bench.HitRatioResult, error) {
+	dir, err := os.MkdirTemp("", "memtier")
 	if err != nil {
 		return bench.HitRatioResult{}, err
 	}
-	return bench.ParseMemtier(out)
-}
-
-// redisBenchArgv builds the redis-benchmark command (local or via the Redis image).
-func redisBenchArgv(tools toolset, port int) []string {
-	base := []string{
-		"redis-benchmark", "-h", "localhost", "-p", fmt.Sprintf("%d", port),
-		"-t", "get,set", "-n", fmt.Sprintf("%d", redisRequests),
-		"-c", fmt.Sprintf("%d", redisClients), "-d", fmt.Sprintf("%d", valueSize), "--csv",
-	}
-	if tools.redisBench == modeDocker {
-		return append([]string{"docker", "run", "--rm", "--network", "host", tools.redisImage}, base...)
-	}
-	return base
-}
-
-// runMemtier runs memtier with a host-mounted output dir (so the JSON lands on the host even
-// when running via Docker) and returns the JSON bytes.
-func runMemtier(tools toolset, port int) ([]byte, error) {
-	dir, err := os.MkdirTemp("", "memtier")
-	if err != nil {
-		return nil, err
-	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	jsonPath := filepath.Join(dir, "out.json")
 
-	stddev := fmt.Sprintf("%d", memtierKeyMax/100) // ~1% hot set
-	args := []string{
-		"-s", "localhost", "-p", fmt.Sprintf("%d", port), "--protocol=redis",
-		"--ratio=1:10", "--key-pattern=G:G", "--key-stddev=" + stddev,
+	cmd := exec.Command("docker", "run", "--rm", "--network", net, "-v", dir+":/out", memtierImage, //nolint:gosec // fixed argv from internal config
+		"-s", cname, "-p", fmt.Sprintf("%d", serverPort), "--protocol=redis",
+		"--ratio="+memtierRatio, "--key-pattern=R:G",
+		fmt.Sprintf("--data-size=%d", memtierValueBytes),
 		fmt.Sprintf("--key-maximum=%d", memtierKeyMax),
+		fmt.Sprintf("--key-median=%d", memtierKeyMedian),
+		fmt.Sprintf("--key-stddev=%d", memtierKeyStddev),
 		"-n", fmt.Sprintf("%d", memtierOps), "-c", fmt.Sprintf("%d", memtierClients),
-		"-t", fmt.Sprintf("%d", memtierThreads), "--hide-histogram",
+		"-t", fmt.Sprintf("%d", memtierThreads),
+		"--print-percentiles", "50,99,99.9", "--json-out-file=/out/out.json")
+	if err := cmd.Run(); err != nil {
+		return bench.HitRatioResult{}, fmt.Errorf("memtier: %w", err)
 	}
-	var argv []string
-	if tools.memtier == modeDocker {
-		argv = append([]string{
-			"docker", "run", "--rm", "--network", "host",
-			"-v", dir + ":/out", tools.memtierImage,
-		}, args...)
-		argv = append(argv, "--json-out-file=/out/out.json")
-	} else {
-		argv = append([]string{"memtier_benchmark"}, args...)
-		argv = append(argv, "--json-out-file="+jsonPath)
+	raw, err := os.ReadFile(filepath.Join(dir, "out.json")) //nolint:gosec // temp file this process just created
+	if err != nil {
+		return bench.HitRatioResult{}, err
 	}
-	if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil { //nolint:gosec // argv from fixed internal tool config, not external input
-		return nil, fmt.Errorf("memtier: %w", err)
-	}
-	return os.ReadFile(jsonPath) //nolint:gosec // jsonPath is a temp file this process just created
+	return bench.ParseMemtier(raw)
 }

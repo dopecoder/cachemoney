@@ -11,10 +11,16 @@ func ParseMemtier(data []byte) (HitRatioResult, error) {
 	var doc struct {
 		AllStats struct {
 			Totals struct {
-				OpsPerSec    float64            `json:"Ops/sec"`
-				HitsPerSec   float64            `json:"Hits/sec"`
-				MissesPerSec float64            `json:"Misses/sec"`
-				Percentiles  map[string]float64 `json:"Percentile Latencies"`
+				OpsPerSec    float64 `json:"Ops/sec"`
+				HitsPerSec   float64 `json:"Hits/sec"`
+				MissesPerSec float64 `json:"Misses/sec"`
+				// memtier nests the aggregate percentiles here (alongside a "Histogram log
+				// format" object, which this struct simply ignores).
+				Percentiles struct {
+					P50  float64 `json:"p50.00"`
+					P99  float64 `json:"p99.00"`
+					P999 float64 `json:"p99.90"`
+				} `json:"Percentile Latencies"`
 			} `json:"Totals"`
 		} `json:"ALL STATS"`
 	}
@@ -36,9 +42,9 @@ func ParseMemtier(data []byte) (HitRatioResult, error) {
 		HitRatio:     t.HitsPerSec / total,
 		OpsPerSec:    t.OpsPerSec,
 		Lat: Latency{
-			P50:  t.Percentiles["p50.00"],
-			P99:  t.Percentiles["p99.00"],
-			P999: t.Percentiles["p99.90"],
+			P50:  t.Percentiles.P50,
+			P99:  t.Percentiles.P99,
+			P999: t.Percentiles.P999,
 		},
 	}, nil
 }

@@ -5,45 +5,30 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/dopecoder/cachemoney/internal/bench"
 )
 
-// mode is how a server (or tool) can be run.
-type mode int
-
-const (
-	modeSkip mode = iota
-	modeLocal
-	modeDocker
-)
-
-// lookup answers availability questions; it is injectable so the plan/skip logic is
-// unit-testable without Docker or any installed binary.
+// lookup answers Docker/image availability; injectable so the planner is unit-testable
+// without a daemon.
 type lookup struct {
-	hasBinary func(name string) bool
 	hasDocker func() bool
 	hasImage  func(image string) bool
 }
 
-// realLookup probes the actual environment.
 func realLookup() lookup {
 	return lookup{
-		hasBinary: func(n string) bool {
-			if _, err := exec.LookPath(n); err == nil {
-				return true
+		hasDocker: func() bool {
+			if _, err := exec.LookPath("docker"); err != nil {
+				return false
 			}
-			_, err := os.Stat(n) // also accept a relative path like bin/cachemoney
-			return err == nil
+			return exec.Command("docker", "info").Run() == nil
 		},
-		hasDocker: func() bool { _, err := exec.LookPath("docker"); return err == nil },
 		hasImage: func(image string) bool {
 			if exec.Command("docker", "image", "inspect", image).Run() == nil {
-				return true // already pulled locally
+				return true
 			}
-			// Not present: pull the pinned image (first run may be slow). Progress is
-			// streamed so the operator sees what is happening; a pull failure (bad image
-			// / no network) leaves the image unavailable and the server is skipped.
 			fmt.Fprintf(os.Stderr, "pulling %s (first run may take a while)...\n", image)
 			pull := exec.Command("docker", "pull", image)
 			pull.Stdout, pull.Stderr = os.Stderr, os.Stderr
@@ -52,48 +37,34 @@ func realLookup() lookup {
 	}
 }
 
-// serverMode chooses how a server can run: a present local binary wins; else a runnable
-// pinned Docker image; else skip.
-func (lk lookup) serverMode(s serverSpec) mode {
-	if s.localBin != "" && lk.hasBinary(s.localBin) {
-		return modeLocal
+// available reports whether Docker is usable and every given image is present/pullable.
+func (lk lookup) available(images ...string) bool {
+	if !lk.hasDocker() {
+		return false
 	}
-	if s.image != "" && lk.hasDocker() && lk.hasImage(s.image) {
-		return modeDocker
+	for _, img := range images {
+		if img != "" && !lk.hasImage(img) {
+			return false
+		}
 	}
-	return modeSkip
+	return true
 }
 
-// toolMode chooses how a bench tool can run: a present local binary, else its image via
-// Docker, else skip.
-func (lk lookup) toolMode(bin, image string) mode {
-	if lk.hasBinary(bin) {
-		return modeLocal
-	}
-	if image != "" && lk.hasDocker() && lk.hasImage(image) {
-		return modeDocker
-	}
-	return modeSkip
-}
+type planned struct{ spec serverSpec }
 
-type planned struct {
-	spec serverSpec
-	mode mode
-}
-
-// plan is the decided run set + the skipped server names.
 type plan struct {
 	run     []planned
 	skipped []string
 }
 
-// makePlan decides, per server, whether it runs (and how) or is skipped — the pure core
-// of skip-when-absent (spec Req 1).
+// makePlan partitions the servers into runnable vs skipped based on Docker + image
+// availability. A server is skipped (never measured) when Docker is absent or any image
+// it needs — its own, the redis tool/probe image, or the memtier image — is unavailable.
 func makePlan(specs []serverSpec, lk lookup) plan {
 	var p plan
 	for _, s := range specs {
-		if m := lk.serverMode(s); m != modeSkip {
-			p.run = append(p.run, planned{s, m})
+		if lk.available(s.images()...) {
+			p.run = append(p.run, planned{s})
 		} else {
 			p.skipped = append(p.skipped, s.name)
 		}
@@ -101,21 +72,20 @@ func makePlan(specs []serverSpec, lk lookup) plan {
 	return p
 }
 
-// measurer runs the bench tools against a started server and returns its result. It is the
-// os/exec orchestration seam; tests inject a fake, and the real one (execMeasurer) runs only
-// when the tooling is present (smoke-covered).
 type measurer func(p planned) (bench.Result, error)
 
-// runCompare produces the comparison Suite: it skips unavailable servers with a clear
-// message (exit-0 contract) and measures the available ones via measure. With an all-absent
-// lookup, measure is never called — no Docker/exec needed (the skip-when-absent path).
+// runCompare benchmarks each runnable server in sequence (one at a time: a server is
+// started, measured, and stopped before the next begins) and collects a Suite. Servers
+// that are unavailable, or whose measurement errors, are recorded as skipped rather than
+// fabricated.
 func runCompare(out io.Writer, specs []serverSpec, lk lookup, measure measurer) bench.Suite {
 	p := makePlan(specs, lk)
 	suite := bench.Suite{Skipped: append([]string(nil), p.skipped...)}
 	for _, name := range p.skipped {
-		_, _ = fmt.Fprintf(out, "skipping %s: no local binary and no runnable pinned Docker image\n", name)
+		_, _ = fmt.Fprintf(out, "skipping %s: Docker or its pinned image is unavailable\n", name)
 	}
 	for _, pl := range p.run {
+		_, _ = fmt.Fprintf(out, "benchmarking %s...\n", pl.spec.name)
 		res, err := measure(pl)
 		if err != nil {
 			_, _ = fmt.Fprintf(out, "skipping %s: %v\n", pl.spec.name, err)
@@ -125,4 +95,62 @@ func runCompare(out io.Writer, specs []serverSpec, lk lookup, measure measurer) 
 		suite.Results = append(suite.Results, res)
 	}
 	return suite
+}
+
+// ensureNetwork creates the bench bridge if it does not already exist.
+func ensureNetwork(name string) error {
+	if exec.Command("docker", "network", "inspect", name).Run() == nil {
+		return nil
+	}
+	return exec.Command("docker", "network", "create", name).Run()
+}
+
+// removeNetwork tears the bench bridge down (best-effort).
+func removeNetwork(name string) { _ = exec.Command("docker", "network", "rm", name).Run() }
+
+// cleanupContainers force-removes any leftover bench server containers from a prior run
+// (best-effort), so a re-run starts clean and the network can be removed.
+func cleanupContainers(specs []serverSpec) {
+	for _, s := range specs {
+		_ = exec.Command("docker", "rm", "-f", containerName(s.name)).Run() //nolint:gosec // fixed internal container name, not external input
+	}
+}
+
+// filterServers narrows specs to the comma-separated names in only (e.g. BENCH_ONLY=redis
+// to benchmark a single product). An empty/blank value keeps every server. Names matching
+// no server are reported to warn (a typo'd BENCH_ONLY otherwise silently runs nothing).
+func filterServers(specs []serverSpec, only string, warn io.Writer) []serverSpec {
+	only = strings.TrimSpace(only)
+	if only == "" {
+		return specs
+	}
+	known := map[string]bool{}
+	for _, s := range specs {
+		known[s.name] = true
+	}
+	want := map[string]bool{}
+	for _, n := range strings.Split(only, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			want[n] = true
+			if !known[n] {
+				_, _ = fmt.Fprintf(warn, "warning: BENCH_ONLY name %q matches no server (known: %s)\n", n, serverNames(specs))
+			}
+		}
+	}
+	out := make([]serverSpec, 0, len(specs))
+	for _, s := range specs {
+		if want[s.name] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// serverNames joins spec names for diagnostics.
+func serverNames(specs []serverSpec) string {
+	names := make([]string, len(specs))
+	for i, s := range specs {
+		names[i] = s.name
+	}
+	return strings.Join(names, ", ")
 }

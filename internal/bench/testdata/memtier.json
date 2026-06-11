@@ -1,13 +1,27 @@
 {
+  "configuration": { "ratio": "1:10" },
+  "run information": { "tool": "memtier_benchmark" },
   "ALL STATS": {
+    "Runtime": { "Total duration": 30000 },
+    "Gets": {
+      "Count": 90000,
+      "Ops/sec": 90000.0,
+      "Hits/sec": 81000.0,
+      "Misses/sec": 9000.0
+    },
     "Totals": {
+      "Count": 100000,
       "Ops/sec": 95234.5,
       "Hits/sec": 81000.0,
       "Misses/sec": 9000.0,
+      "Latency": 0.5,
       "Percentile Latencies": {
         "p50.00": 0.420,
         "p99.00": 1.310,
-        "p99.90": 3.780
+        "p99.90": 3.780,
+        "Histogram log format": {
+          "Compressed Histogram": "HISTFAAAAHh4nJNpmSzMwMAQxQABTFCaC0Q="
+        }
       }
     }
   }

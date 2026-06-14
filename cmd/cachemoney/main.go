@@ -45,6 +45,16 @@ func main() {
 	srv := server.New(engine, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	if os.Getenv("CM_NET") == "gnet" { // SPIKE: epoll event-loop backend
+		stop()
+		log.Printf("cachemoney %s listening on %s (gnet event loop)", version, cfg.Addr)
+		err = srv.ListenAndServeGnet()
+		_ = engine.Close()
+		if err != nil {
+			log.Fatalf("cachemoney: %v", err)
+		}
+		return
+	}
 	log.Printf("cachemoney %s listening on %s", version, cfg.Addr)
 	err = run(ctx, srv, cfg.DrainTimeout)
 	stop() // release the signal handler before any fatal exit

@@ -1,0 +1,3 @@
+# CDK v2 needs a recent aws-cdk-lib for the PlacementGroup L2 and Instance.placement_group prop.
+aws-cdk-lib>=2.150.0,<3.0.0
+constructs>=10.0.0,<11.0.0

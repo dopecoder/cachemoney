@@ -1,0 +1,11 @@
+# Python / CDK / generated benchmark outputs — never commit these.
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+cdk.out/
+cdk.context.json
+results.csv
+SUMMARY.md
+# Never commit private keys.
+*.pem

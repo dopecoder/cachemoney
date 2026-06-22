@@ -49,6 +49,10 @@ RigStack(
     key_name=key_name,
     allowed_ssh_cidr=str(allowed_ssh_cidr),
     volume_gb=int(ctx("volume_gb", "30")),
+    # Cluster placement group: required for the metal run, unsupported on burstable t4g.*
+    # smoke instances. Pass -c placement_group=false for the tiny smoke.
+    use_placement_group=ctx("placement_group", "true").lower()
+    not in ("false", "0", "no"),
     env=cdk.Environment(
         account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
         region=os.environ.get("CDK_DEFAULT_REGION"),

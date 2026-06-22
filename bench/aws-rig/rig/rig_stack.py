@@ -1,9 +1,10 @@
 """CDK stack for the cachemoney two-machine benchmark rig.
 
-A single-AZ VPC, a cluster placement group (max inter-node bandwidth / min latency), one
-security group that allows ALL traffic between the two instances plus SSH from the operator,
-and two Graviton (arm64) instances: a server-under-test and a load generator. Instance types
-are parameters so you smoke on small instances first, then run on the metal pair.
+A single-AZ VPC, an optional cluster placement group (max inter-node bandwidth / min
+latency; unsupported on burstable t4g smoke instances), one security group that allows ALL
+traffic between the two instances plus SSH from the operator, and two Ubuntu 24.04 arm64
+(Graviton) instances: a server-under-test and a load generator. Instance types are parameters
+so you smoke on small instances first, then run on the metal pair.
 """
 
 from pathlib import Path
@@ -31,6 +32,7 @@ class RigStack(Stack):
         key_name: str,
         allowed_ssh_cidr: str,
         volume_gb: int,
+        use_placement_group: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -51,10 +53,13 @@ class RigStack(Stack):
         )
 
         # Cluster strategy keeps both nodes on the same low-latency, high-bandwidth segment.
-        placement_group = ec2.PlacementGroup(
-            self,
-            "Pg",
-            strategy=ec2.PlacementGroupStrategy.CLUSTER,
+        # NOTE: cluster placement groups are NOT supported by burstable T-family instances
+        # (t4g.*), so the tiny smoke runs without one (-c placement_group=false). It is
+        # essential for the metal run and on by default.
+        placement_group = (
+            ec2.PlacementGroup(self, "Pg", strategy=ec2.PlacementGroupStrategy.CLUSTER)
+            if use_placement_group
+            else None
         )
 
         sg = ec2.SecurityGroup(
@@ -72,8 +77,9 @@ class RigStack(Stack):
             ec2.Peer.ipv4(allowed_ssh_cidr), ec2.Port.tcp(22), "operator ssh"
         )
 
-        ami = ec2.MachineImage.latest_amazon_linux2023(
-            cpu_type=ec2.AmazonLinuxCpuType.ARM_64,
+        ami = ec2.MachineImage.from_ssm_parameter(
+            "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id",
+            os=ec2.OperatingSystemType.LINUX,
         )
         key = ec2.KeyPair.from_key_pair_name(self, "Key", key_name)
         role = iam.Role(
@@ -88,7 +94,7 @@ class RigStack(Stack):
         )
         block_devices = [
             ec2.BlockDevice(
-                device_name="/dev/xvda",
+                device_name="/dev/sda1",  # Ubuntu (noble) root device
                 volume=ec2.BlockDeviceVolume.ebs(
                     volume_gb,
                     volume_type=ec2.EbsDeviceVolumeType.GP3,
@@ -128,8 +134,8 @@ class RigStack(Stack):
         CfnOutput(self, "ClientPublicIp", value=client.instance_public_ip)
         CfnOutput(self, "ServerPrivateIp", value=server.instance_private_ip)
         CfnOutput(self, "ClientPrivateIp", value=client.instance_private_ip)
-        CfnOutput(self, "SshServer", value=f"ssh ec2-user@{server.instance_public_ip}")
-        CfnOutput(self, "SshClient", value=f"ssh ec2-user@{client.instance_public_ip}")
+        CfnOutput(self, "SshServer", value=f"ssh ubuntu@{server.instance_public_ip}")
+        CfnOutput(self, "SshClient", value=f"ssh ubuntu@{client.instance_public_ip}")
         CfnOutput(
             self,
             "RunHint",

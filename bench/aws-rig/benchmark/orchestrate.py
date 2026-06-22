@@ -685,7 +685,7 @@ def main() -> int:
         "--server-private", required=True, help="server private IP (load target)"
     )
     ap.add_argument("--key", required=True, help="path to the EC2 private key (.pem)")
-    ap.add_argument("--user", default="ec2-user")
+    ap.add_argument("--user", default="ubuntu")
     ap.add_argument(
         "--client-cores", default="", help="numactl -C list to pin memtier, e.g. 0-79"
     )
@@ -729,6 +729,18 @@ def main() -> int:
         specs += build_e2(args.quick, server_cores)
     if "e3" in selected:
         specs += build_e3(args.quick)
+
+    # Clamp every spec to the server's actual core count: the fixed-8-core experiments (E1/E3)
+    # and any gnet-loops/io-threads would otherwise emit `numactl -C 0-7` on a 2-core smoke box
+    # and fail to start. core_count drives the numactl range, GOMAXPROCS, loops, and io-threads.
+    for spec in specs:
+        if spec.core_count > server_cores:
+            spec.core_count = server_cores
+            spec.cores = cores_str(server_cores)
+        if spec.gnet_loops > server_cores:
+            spec.gnet_loops = server_cores
+        if spec.io_threads > server_cores:
+            spec.io_threads = server_cores
 
     print(f"running {len(specs)} configurations -> {args.out}")
     import csv

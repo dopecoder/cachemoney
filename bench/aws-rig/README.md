@@ -14,8 +14,8 @@ bench/aws-rig/
 ├── BENCHMARK-PLAN.md      # the experiment design (what/how) — read this first
 ├── app.py  cdk.json  requirements.txt  rig/rig_stack.py   # CDK (VPC, SG, placement group, 2 instances)
 ├── provision/             # native installs baked into user-data (no Docker)
-│   ├── server_setup.sh    #   redis 7.4 + valkey 8.1 + pogocache 1.3.1 from source + tuning
-│   └── client_setup.sh    #   memtier 2.4.2 + redis tooling + sysstat
+│   ├── server_setup.sh    #   redis 7.4 (apt) + valkey 8.1 + pogocache 1.3.1 (binaries) + tuning
+│   └── client_setup.sh    #   memtier + redis tooling (apt) + sysstat
 ├── deploy_cachemoney.sh   # build cachemoney arm64 (with the gnet spike) + upload
 └── benchmark/
     ├── orchestrate.py     # the sweep: start DBs, drive load, capture validity stats -> results.csv
@@ -58,13 +58,13 @@ cdk deploy -c key_name=cm-rig -c allowed_ssh_cidr=$(curl -s ifconfig.me)/32
 ```
 
 CDK prints `ServerPublicIp`, `ClientPublicIp`, `ServerPrivateIp`. Wait for provisioning
-(source builds take a few minutes; the scripts add swap so they don't OOM on 2 GB) until the
+(Ubuntu 24.04; apt + prebuilt binaries, ~1 min) until the
 sentinel exists on **both** hosts:
 
 ```bash
-ssh -i ~/.ssh/cm-rig.pem ec2-user@<ServerPublicIp> 'tail -f /var/log/cm-setup.log'   # Ctrl-C at "done"
-ssh -i ~/.ssh/cm-rig.pem ec2-user@<ServerPublicIp> 'test -f /opt/cm-setup-done && echo READY'
-ssh -i ~/.ssh/cm-rig.pem ec2-user@<ClientPublicIp> 'test -f /opt/cm-setup-done && echo READY'
+ssh -i ~/.ssh/cm-rig.pem ubuntu@<ServerPublicIp> 'tail -f /var/log/cm-setup.log'   # Ctrl-C at "done"
+ssh -i ~/.ssh/cm-rig.pem ubuntu@<ServerPublicIp> 'test -f /opt/cm-setup-done && echo READY'
+ssh -i ~/.ssh/cm-rig.pem ubuntu@<ClientPublicIp> 'test -f /opt/cm-setup-done && echo READY'
 ```
 
 Upload cachemoney, then run the reduced matrix:
@@ -127,7 +127,7 @@ number, so it's enforced in code here.
 
 ## Troubleshooting
 
-- **Provisioning stuck / a server won't start:** `ssh ec2-user@<host> 'cat /var/log/cm-setup.log'`
+- **Provisioning stuck / a server won't start:** `ssh ubuntu@<host> 'cat /var/log/cm-setup.log'`
   and `cat /tmp/cm-srv-<port>.log`. The likeliest fix is a flag-name mismatch for
   `pogocache`/`valkey` — adjust `SERVER_CMDS` in `orchestrate.py` after checking `--help` on
   the box (the templates are centralized at the top of the file for exactly this reason).

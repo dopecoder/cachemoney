@@ -8,7 +8,7 @@ set -euo pipefail
 
 SERVER="${1:?usage: deploy_cachemoney.sh <server-public-ip> <ssh-key.pem>}"
 KEY="${2:?usage: deploy_cachemoney.sh <server-public-ip> <ssh-key.pem>}"
-SSH_USER="${SSH_USER:-ec2-user}"
+SSH_USER="${SSH_USER:-ubuntu}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"

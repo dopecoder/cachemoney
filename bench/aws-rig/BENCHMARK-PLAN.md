@@ -32,7 +32,8 @@ run the real sweep on the metal pair.
 
 Ports (one server runs at a time, but fixed for clarity): std 6390, gnet 6391, redis 6379,
 valkey 6380, pogocache 6381. cachemoney is built from repo HEAD for `arm64` (carries the gnet
-spike) and uploaded; the rest are built from source on the server.
+spike) and uploaded; redis comes from the redis.io apt repo and valkey/pogocache from their
+official prebuilt arm64 binaries (no source compilation).
 
 ## Validity instrumentation — captured on EVERY run (non-negotiable)
 

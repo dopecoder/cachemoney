@@ -1,40 +1,34 @@
 #!/usr/bin/env bash
-# client_setup.sh — provision the load generator on Amazon Linux 2023 (arm64).
-# Builds memtier_benchmark at a pinned version, installs redis tooling (redis-cli for
-# readiness probes, redis-benchmark for the pipelined throughput ceiling), observability
-# tools, and Python for analysis. Drops a sentinel at /opt/cm-setup-done.
+# client_setup.sh — provision the load generator on Ubuntu 24.04 (noble, arm64).
+# Readily-available builds (no source compilation): memtier-benchmark + redis tooling from
+# the redis.io apt repo, plus observability tools and Python. Drops a sentinel.
 #
-# Watch progress:  ssh ec2-user@<client> tail -f /var/log/cm-setup.log
+# Watch:  ssh ubuntu@<client> tail -f /var/log/cm-setup.log
 set -euxo pipefail
-
-MEMTIER_VERSION="${MEMTIER_VERSION:-2.4.2}"
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
 
 exec > >(tee -a /var/log/cm-setup.log) 2>&1
-echo "=== cm client setup start $(date -u) memtier=$MEMTIER_VERSION ==="
+echo "=== cm client setup start $(date -u) ==="
 
-dnf -y groupinstall "Development Tools" || true
-dnf -y install gcc gcc-c++ make git tar wget which \
-  autoconf automake libtool pkgconf \
-  openssl-devel pcre2-devel libevent-devel zlib-devel \
-  sysstat numactl util-linux python3 python3-pip redis6
+# Ubuntu's first-boot unattended-upgrades / apt-daily hold the dpkg lock; stop them and make
+# every apt-get WAIT for the lock (up to 600s) instead of deadlocking user-data.
+echo 'DPkg::Lock::Timeout "600";' >/etc/apt/apt.conf.d/99cmbench-lock
+systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service \
+  apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 
-# --- swap (so the memtier build doesn't OOM on tiny-RAM smoke instances) --------------
-mem_mb="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
-if [ ! -e /swapfile ] && [ "$mem_mb" -lt 4096 ]; then
-  fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
-  chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-fi
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg lsb-release sysstat numactl python3 python3-pip
 
-# --- memtier_benchmark (the primary load generator) --------------------------------
-if [ ! -x /usr/local/bin/memtier_benchmark ]; then
-  mkdir -p /opt/src && cd /opt/src
-  git clone --depth 1 --branch "${MEMTIER_VERSION}" https://github.com/RedisLabs/memtier_benchmark.git
-  cd memtier_benchmark
-  autoreconf -ivf
-  ./configure
-  make -j"$(nproc)"
-  make install
-fi
+# --- redis.io apt repo (memtier-benchmark + redis-cli/redis-benchmark live here) ----
+install -m 0755 -d /usr/share/keyrings
+curl -fsSL https://packages.redis.io/gpg | gpg --batch --yes --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+chmod 0644 /usr/share/keyrings/redis-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" \
+  >/etc/apt/sources.list.d/redis.list
+apt-get update -y
+
+apt-get install -y memtier-benchmark redis-tools
 
 # Match the server's connection/fd tuning so the generator is never the artificial limit.
 cat >/etc/sysctl.d/99-cmbench.conf <<'EOF'
@@ -49,7 +43,7 @@ cat >/etc/security/limits.d/99-cmbench.conf <<'EOF'
 * hard nofile 1048576
 EOF
 
-echo "memtier: $(/usr/local/bin/memtier_benchmark --version | head -1)"
-echo "redis-benchmark: $(redis6-benchmark --version 2>/dev/null || redis-benchmark --version 2>/dev/null || echo MISSING)"
+echo "memtier: $(memtier_benchmark --version | head -1)"
+echo "redis-cli: $(redis-cli --version)"
 echo "=== cm client setup done $(date -u) ==="
 touch /opt/cm-setup-done

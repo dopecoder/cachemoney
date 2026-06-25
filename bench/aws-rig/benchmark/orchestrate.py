@@ -97,6 +97,7 @@ class Spec:
     threads: int = 4
     conns: int = 13  # per thread; total = threads*conns
     rate_limit: int = 0  # per-connection rps; 0 = closed-loop
+    pipeline: int = 1  # requests in flight per connection; >1 only for throughput (E2)
 
 
 # ---------------------------------------------------------------------------------------
@@ -337,6 +338,8 @@ def memtier_cmd(
         "--print-percentiles 50,99,99.9,99.99",
         f"--json-out-file={out_json}",
     ]
+    if spec.pipeline > 1:
+        args.append(f"--pipeline={spec.pipeline}")
     if spec.rate_limit > 0:
         args.append(f"--rate-limiting={spec.rate_limit}")
     return " ".join(a for a in args if a)
@@ -464,12 +467,18 @@ def execute(r: Remote, args, spec: Spec) -> dict:
         or cli_nic_total >= 0.8 * nic_line
     )
     valid = "valid"
+    # Under-generation: a closed-loop "saturation" run where the SERVER never got busy and the
+    # client/NIC weren't the limit either means we simply didn't push hard enough — the ops/s
+    # is the generator's ceiling, not the server's. That's the observer-effect trap, so flag it.
+    under_generated = spec.rate_limit == 0 and srv["cpu_avg"] < float(args.min_srv_cpu)
     if failed:
         valid = "memtier-failed"
     elif client_saturated:
         valid = "rig-limited:client-cpu"
     elif nic_hot:
         valid = "rig-limited:nic"
+    elif under_generated:
+        valid = f"under-generated:srv-cpu<{int(args.min_srv_cpu)}"
     elif cov > 0.05:
         valid = "noisy:cov>5%"
 
@@ -506,6 +515,7 @@ def _row_meta(spec: Spec) -> dict:
         "data_size": spec.data_size,
         "ratio": spec.ratio,
         "total_conns": spec.threads * spec.conns,
+        "pipeline": spec.pipeline,
         "rate_limit_pc": spec.rate_limit,
     }
 
@@ -565,7 +575,9 @@ def build_e1(quick: bool) -> list[Spec]:
     return specs
 
 
-def build_e2(quick: bool, server_cores: int) -> list[Spec]:
+def build_e2(
+    quick: bool, server_cores: int, client_cores: int, pipeline: int
+) -> list[Spec]:
     """Vertical scaling: sweep server cores, saturation, redis/valkey single + io-threads."""
     ladder = [1, 2, 4, 8] if quick else [1, 2, 4, 8, 16, 32, 48, 96]
     ns = [n for n in ladder if n <= server_cores]
@@ -579,8 +591,12 @@ def build_e2(quick: bool, server_cores: int) -> list[Spec]:
     ]
     specs = []
     for n in ns:
-        total = min(100 * n, 4000)
-        threads = min(n * 4, 64)
+        # Drive with most of the client's cores (reserve ~1/8 for its own softirq) and
+        # pipeline so we saturate a high-core SERVER instead of measuring the generator's
+        # ceiling. Connections scale with server cores.
+        reserve = client_cores // 8
+        threads = max(min(client_cores - reserve, 96), 1)
+        total = min(128 * n, 16000)
         conns = max(total // threads, 1)
         for subj in subjects:
             specs.append(
@@ -601,6 +617,7 @@ def build_e2(quick: bool, server_cores: int) -> list[Spec]:
                     threads=threads,
                     conns=conns,
                     rate_limit=0,
+                    pipeline=pipeline,
                 )
             )
     return specs
@@ -654,6 +671,7 @@ CSV_FIELDS = [
     "data_size",
     "ratio",
     "total_conns",
+    "pipeline",
     "rate_limit_pc",
     "ops",
     "p50",
@@ -695,6 +713,18 @@ def main() -> int:
         default=25000,
         help="instance NIC line rate in Mbps for the NIC-saturation gate (e.g. 30000-50000 on metal)",
     )
+    ap.add_argument(
+        "--pipeline",
+        type=int,
+        default=16,
+        help="E2 throughput pipelining (requests in flight per connection); 1 = none",
+    )
+    ap.add_argument(
+        "--min-srv-cpu",
+        type=float,
+        default=65.0,
+        help="closed-loop runs whose server CPU%% stays below this are flagged under-generated",
+    )
     ap.add_argument("--experiments", default="e1,e2,e3")
     ap.add_argument(
         "--quick", action="store_true", help="reduced matrix for smoke runs"
@@ -721,12 +751,20 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    rc, cout = r.run(args.client, "nproc")
+    client_cores = int(cout.strip()) if cout.strip().isdigit() else 8
+    if args.client_cores:
+        client_cores = len(_expand_cpu_list(args.client_cores))
+    print(
+        f"client offers {client_cores} cores for load generation (pipeline={args.pipeline})"
+    )
+
     selected = [e.strip().lower() for e in args.experiments.split(",")]
     specs: list[Spec] = []
     if "e1" in selected:
         specs += build_e1(args.quick)
     if "e2" in selected:
-        specs += build_e2(args.quick, server_cores)
+        specs += build_e2(args.quick, server_cores, client_cores, args.pipeline)
     if "e3" in selected:
         specs += build_e3(args.quick)
 

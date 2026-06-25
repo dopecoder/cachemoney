@@ -46,8 +46,12 @@ official prebuilt arm64 binaries (no source compilation).
 
 Protocol: **warmup 10 s, measure 30 s, 3 repeats**; report median + min/max; flag if
 coefficient of variation > 5 %. **Per-run validity gate** — a result is `valid` only if the
-client is not saturated (busy cores < 85 %) and the NIC is below ~80 % of line rate;
-otherwise the row is tagged `rig-limited` and excluded from headline conclusions.
+client is not saturated (pinned-core busy < 85 %), the NIC is below ~80 % of line rate, AND
+(for closed-loop saturation runs) the **server CPU actually got busy** (≥ the `--min-srv-cpu`
+floor, default 65 %). Otherwise the row is tagged `rig-limited:*` or **`under-generated:*`**
+(we didn't push hard enough — the ops/s is the generator's ceiling, not the server's) and is
+excluded from headline conclusions. The load generator scales to the client's core count and
+pipelines on the E2 throughput axis specifically to avoid under-generation on high-core servers.
 
 ## Tooling
 
@@ -83,10 +87,11 @@ flat; io-threads redis scales partway.*
 - Server cores **N ∈ {1, 2, 4, 8, 16, 32, 48, 96}**, pinned `0..N-1`; the remaining
   `96-N` cores stay free for softirq. At large N that headroom shrinks even on a dedicated
   box — the instrumentation will **reveal the knee, and we report it** rather than hide it.
-- Closed-loop saturation; concurrency is scaled to saturate each N (~100×N, capped) and
-  saturation is **confirmed from the server-CPU instrumentation** rather than a full
-  connection sweep (the orchestrator runs one saturating concurrency per N to keep the metal
-  run affordable; widen it in `build_e2` if a point looks under-saturated). Value **64 B**
+- Closed-loop saturation; concurrency is **scaled to the client's core count** (memtier runs
+  ~`client_cores` threads, reserving ~1/8 for client softirq) with **`--pipeline` (default 16)**
+  so we generate enough in-flight work to saturate a high-core server rather than measure the
+  generator's ceiling. Connections scale with N (up to ~16 k). The `under-generated` gate
+  flags any point where the server still didn't get busy. Value **64 B**
   (4 KB secondary). No pipelining for
   the saturation-latency read; optional `-P 16` for the throughput ceiling.
 - Subjects per N: std (`GOMAXPROCS=N`), gnet (`loops=N`), redis-iothreads

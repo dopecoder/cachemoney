@@ -17,6 +17,7 @@ bench/aws-rig/
 │   ├── server_setup.sh    #   redis 7.4 (apt) + valkey 8.1 + pogocache 1.3.1 (binaries) + tuning
 │   └── client_setup.sh    #   memtier + redis tooling (apt) + sysstat
 ├── deploy_cachemoney.sh   # build cachemoney arm64 (with the gnet spike) + upload
+├── nuke.sh                # COMPLETE teardown: rig + bootstrap + assets bucket + key pair
 └── benchmark/
     ├── orchestrate.py     # the sweep: start DBs, drive load, capture validity stats -> results.csv
     └── analyze.py         # results.csv -> per-experiment comparison tables
@@ -102,18 +103,35 @@ python3 benchmark/orchestrate.py \
 python3 benchmark/analyze.py results.csv | tee SUMMARY.md
 ```
 
-## 3. Tear down (stop paying)
+## 3. Tear down
 
 ```bash
-cdk destroy
+cdk destroy            # removes the rig stack (instances/VPC/SG) — but DELIBERATELY leaves
+                       # the CDK bootstrap stack, its (versioned) assets S3 bucket, and the
+                       # key pair behind, so they can be reused by the next deploy.
 ```
+
+Note: terminated instances linger in the EC2 console for ~1 h then auto-purge — they are not
+billing and cannot be manually deleted.
+
+To remove **everything** (rig stack + bootstrap stack + versioned assets bucket + ECR repo +
+SSM param + key pair + local `.pem`) for a true clean slate:
+
+```bash
+./nuke.sh                  # idempotent; nukes it all in $AWS_REGION (default us-west-2)
+KEEP_KEYPAIR=1 ./nuke.sh   # ...but keep the key pair + .pem
+```
+
+After a full nuke, recreate from zero with: recreate the key pair, `cdk bootstrap`, then
+`cdk deploy` (step 1).
 
 ## Cost
 
 On-demand us-east-1, **both** instances, for a ~1-2 h session then destroy: the tiny ARM
 smoke (`t4g.medium` + `t4g.small`) is **~5-8¢/hr combined** (a full smoke is well under $1);
 the metal pair (`r8g.metal-24xl` + `c8g.24xlarge`) is roughly **$15-25/hr combined**, so a
-focused run is ~$20-40. `cdk destroy` removes everything. Spot can cut the metal cost ~60-70%.
+focused run is ~$20-40. `./nuke.sh` removes **everything** (`cdk destroy` leaves the bootstrap
+bucket + key pair). Spot can cut the metal cost ~60-70%.
 
 ## How we keep the numbers honest
 

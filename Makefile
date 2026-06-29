@@ -92,7 +92,7 @@ bench-compare: build
 	CGO_ENABLED=0 $(GO) build -o $(BIN_DIR)/cachemoney-static $(MAIN_PKG)
 	$(GO) build -o $(BIN_DIR)/cmbench ./cmd/cmbench
 	set -a; . ./bench/versions.env; set +a; \
-		BENCH_DOC=docs/benchmarks/bench-vs-redis.md $(BIN_DIR)/cmbench
+		$(BIN_DIR)/cmbench
 
 ## build: Build the cachemoney binary.
 .PHONY: build
